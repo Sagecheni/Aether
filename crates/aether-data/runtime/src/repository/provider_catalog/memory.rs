@@ -6,11 +6,13 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use super::{
+    patch_provider_catalog_runtime_credentials, provider_catalog_runtime_credentials_cas_matches,
     ProviderCatalogKeyAdaptiveState, ProviderCatalogKeyAdaptiveStateUpdate,
     ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
     ProviderCatalogKeyListQuery, ProviderCatalogKeyOAuthCredentialCasDelete,
     ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-    ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository, ProviderCatalogSnapshot,
+    ProviderCatalogKeyStatusSnapshotUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogRuntimeCredentialsCas, ProviderCatalogSnapshot,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
@@ -452,6 +454,36 @@ impl ProviderCatalogWriteRepository for InMemoryProviderCatalogReadRepository {
         };
         *stored = provider.clone();
         Ok(stored.clone())
+    }
+
+    async fn compare_and_patch_provider_ops_runtime_credentials(
+        &self,
+        update: &ProviderCatalogRuntimeCredentialsCas,
+    ) -> Result<bool, DataLayerError> {
+        let mut index = self
+            .index
+            .write()
+            .expect("provider catalog repository lock");
+        let Some(provider) = index.providers.get_mut(&update.provider_id) else {
+            return Ok(false);
+        };
+        if !provider_catalog_runtime_credentials_cas_matches(
+            provider.config.as_ref(),
+            provider.website.as_deref(),
+            provider.proxy.as_ref(),
+            update,
+        ) {
+            return Ok(false);
+        }
+        let Some(config) = provider.config.as_mut() else {
+            return Ok(false);
+        };
+        patch_provider_catalog_runtime_credentials(config, &update.encrypted_credentials)?;
+        provider.updated_at_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs());
+        Ok(true)
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {

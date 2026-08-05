@@ -4,7 +4,9 @@ use super::super::balance_cache::{
     read_admin_provider_ops_balance_cache, spawn_admin_provider_ops_balance_refresh,
     store_admin_provider_ops_balance_cache, AdminProviderOpsBalanceCacheLookup,
 };
-use super::super::config::admin_provider_ops_config_object;
+use super::super::config::{
+    admin_provider_ops_config_object, admin_provider_ops_remote_quota_enabled,
+};
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
 use axum::{
@@ -76,14 +78,22 @@ pub(super) async fn handle_admin_provider_ops_batch_balance(
             .cloned()
             .unwrap_or_default();
         async move {
+            let remote_quota_enabled = provider
+                .as_ref()
+                .is_some_and(admin_provider_ops_remote_quota_enabled);
             let result = if provider
                 .as_ref()
                 .is_some_and(|provider| admin_provider_ops_config_object(provider).is_some())
             {
                 match read_admin_provider_ops_balance_cache(state, &provider_id).await {
                     AdminProviderOpsBalanceCacheLookup::Hit(cached) => {
-                        spawn_admin_provider_ops_balance_refresh(state, &provider_id).await;
+                        if !remote_quota_enabled {
+                            spawn_admin_provider_ops_balance_refresh(state, &provider_id).await;
+                        }
                         cached
+                    }
+                    AdminProviderOpsBalanceCacheLookup::Miss if remote_quota_enabled => {
+                        admin_provider_ops_pending_balance_response("暂无缓存的余额数据")
                     }
                     AdminProviderOpsBalanceCacheLookup::Miss => {
                         if state.runtime_state().is_memory() {
@@ -105,6 +115,9 @@ pub(super) async fn handle_admin_provider_ops_batch_balance(
                                 "余额数据加载中，请稍后刷新",
                             )
                         }
+                    }
+                    AdminProviderOpsBalanceCacheLookup::Unavailable if remote_quota_enabled => {
+                        admin_provider_ops_pending_balance_response("余额缓存不可用")
                     }
                     AdminProviderOpsBalanceCacheLookup::Unavailable => {
                         let payload = admin_provider_ops_local_action_response(

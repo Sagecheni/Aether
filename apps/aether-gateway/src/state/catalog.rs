@@ -556,6 +556,16 @@ impl AppState {
         Ok(updated)
     }
 
+    pub(crate) async fn compare_and_patch_provider_ops_runtime_credentials(
+        &self,
+        update: &provider_catalog::ProviderCatalogRuntimeCredentialsCas,
+    ) -> Result<Option<bool>, GatewayError> {
+        self.data
+            .compare_and_patch_provider_ops_runtime_credentials(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,

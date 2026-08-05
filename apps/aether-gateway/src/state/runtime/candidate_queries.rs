@@ -99,6 +99,19 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn apply_remote_provider_quota(
+        &self,
+        patch: &quota::ApplyRemoteProviderQuotaPatch,
+    ) -> Result<quota::ApplyRemoteProviderQuotaOutcome, GatewayError> {
+        let outcome = self
+            .data
+            .apply_remote_provider_quota(patch)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.provider_quota_snapshot_cache.clear();
+        Ok(outcome)
+    }
+
     pub(crate) async fn read_recent_request_candidates(
         &self,
         limit: usize,

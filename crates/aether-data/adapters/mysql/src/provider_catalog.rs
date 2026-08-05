@@ -8,12 +8,14 @@ use sqlx::{
 };
 
 use aether_data_contracts::repository::provider_catalog::{
+    patch_provider_catalog_runtime_credentials, provider_catalog_runtime_credentials_cas_matches,
     ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogReadRepository, ProviderCatalogRuntimeCredentialsCas,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -548,6 +550,55 @@ WHERE id = ?
             )));
         }
         self.reload_provider(&provider.id, "updated").await
+    }
+
+    pub async fn compare_and_patch_provider_ops_runtime_credentials(
+        &self,
+        update: &ProviderCatalogRuntimeCredentialsCas,
+    ) -> Result<bool, DataLayerError> {
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let Some(row) =
+            sqlx::query("SELECT config, website, proxy FROM providers WHERE id = ? FOR UPDATE")
+                .bind(&update.provider_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?
+        else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let mut config =
+            optional_json_from_string(row.try_get("config").map_sql_err()?, "providers.config")?;
+        let website: Option<String> = row.try_get("website").map_sql_err()?;
+        let proxy =
+            optional_json_from_string(row.try_get("proxy").map_sql_err()?, "providers.proxy")?;
+        if !provider_catalog_runtime_credentials_cas_matches(
+            config.as_ref(),
+            website.as_deref(),
+            proxy.as_ref(),
+            update,
+        ) {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let Some(config) = config.as_mut() else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        patch_provider_catalog_runtime_credentials(config, &update.encrypted_credentials)?;
+        let encoded_config = serde_json::to_string(config).map_err(|error| {
+            DataLayerError::UnexpectedValue(format!(
+                "providers.config serialization failed: {error}"
+            ))
+        })?;
+        sqlx::query("UPDATE providers SET config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(encoded_config)
+            .bind(&update.provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
     }
 
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
@@ -2040,6 +2091,13 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, DataLayerError> {
         Self::update_provider(self, provider).await
+    }
+
+    async fn compare_and_patch_provider_ops_runtime_credentials(
+        &self,
+        update: &ProviderCatalogRuntimeCredentialsCas,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_patch_provider_ops_runtime_credentials(self, update).await
     }
 
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {

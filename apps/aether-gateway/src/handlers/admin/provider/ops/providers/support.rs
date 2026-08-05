@@ -35,6 +35,10 @@ pub(super) struct AdminProviderOpsSaveConfigRequest {
     pub(crate) schedule: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) quota_alert: Option<AdminProviderOpsQuotaAlertConfigRequest>,
+    #[serde(default)]
+    pub(crate) remote_quota: Option<AdminProviderOpsRemoteQuotaConfigRequest>,
+    #[serde(default)]
+    pub(crate) discover_sub2api_groups: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +66,16 @@ pub(super) struct AdminProviderOpsQuotaAlertConfigRequest {
     pub(crate) threshold_amount: Option<f64>,
     #[serde(default)]
     pub(crate) fetch_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AdminProviderOpsRemoteQuotaConfigRequest {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) group_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) progress_endpoint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

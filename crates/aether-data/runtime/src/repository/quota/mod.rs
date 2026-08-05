@@ -2,8 +2,8 @@ mod memory;
 
 #[allow(unused_imports)]
 pub(crate) use aether_data_contracts::repository::quota::{
-    ProviderQuotaReadRepository, ProviderQuotaRepository, ProviderQuotaWriteRepository,
-    StoredProviderQuotaSnapshot,
+    ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository,
+    ProviderQuotaRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
 #[cfg(feature = "mysql")]
 pub use aether_data_mysql::MysqlProviderQuotaRepository;

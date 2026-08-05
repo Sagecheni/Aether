@@ -8,9 +8,16 @@ use super::super::responses::{
 };
 use super::super::support::admin_provider_ops_json_object_map;
 use crate::handlers::admin::request::AdminAppState;
-use aether_admin::provider::ops::parse_sub2api_balance_payload;
+use crate::handlers::shared::system_config_bool;
+use aether_admin::provider::ops::{
+    parse_sub2api_balance_payload, parse_sub2api_remote_quota, parse_sub2api_remote_quota_groups,
+    validate_sub2api_same_origin_endpoint, Sub2ApiRemoteQuotaConfig, Sub2ApiRemoteQuotaSnapshot,
+};
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+use aether_data_contracts::repository::quota::{
+    ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
+};
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -22,6 +29,7 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
     action_config: &serde_json::Map<String, serde_json::Value>,
     credentials: &serde_json::Map<String, serde_json::Value>,
     proxy_snapshot: Option<&ProxySnapshot>,
+    remote_quota_config: Option<&Sub2ApiRemoteQuotaConfig>,
 ) -> serde_json::Value {
     let start = std::time::Instant::now();
     let (access_token, updated_credentials, _frontend_updated_credentials) =
@@ -76,8 +84,23 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
     .filter(|value| !value.is_empty())
     .unwrap_or("/api/v1/subscriptions/summary")
     .to_string();
+    if remote_quota_config.is_some() {
+        for endpoint in [me_endpoint, subscription_endpoint.as_str()] {
+            if let Err(message) = validate_sub2api_same_origin_endpoint(endpoint) {
+                return admin_provider_ops_action_error(
+                    "parse_error",
+                    "query_balance",
+                    message,
+                    None,
+                );
+            }
+        }
+    }
     let subscription_url =
         admin_provider_ops_sub2api_request_url(base_url, subscription_endpoint.as_str());
+    let progress_url = remote_quota_config.map(|config| {
+        admin_provider_ops_sub2api_request_url(base_url, config.progress_endpoint.as_str())
+    });
 
     let auth_value = match reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}"))
     {
@@ -96,7 +119,24 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
     let me_request_id = format!("provider-ops-action:sub2api:me:{provider_id}");
     let subscription_request_id =
         format!("provider-ops-action:sub2api:subscriptions:{provider_id}");
-    let (me_result, subscription_result) = tokio::join!(
+    let progress_request_id = format!("provider-ops-action:sub2api:progress:{provider_id}");
+    let progress_request = async {
+        let Some(progress_url) = progress_url.as_deref() else {
+            return Ok(None);
+        };
+        admin_provider_ops_execute_json_request(
+            state,
+            &progress_request_id,
+            reqwest::Method::GET,
+            progress_url,
+            &auth_headers,
+            None,
+            proxy_snapshot,
+        )
+        .await
+        .map(Some)
+    };
+    let (me_result, subscription_result, progress_result) = tokio::join!(
         admin_provider_ops_execute_json_request(
             state,
             &me_request_id,
@@ -114,16 +154,15 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
             &auth_headers,
             None,
             proxy_snapshot,
-        )
+        ),
+        progress_request
     );
     let me_result = me_result.map_err(|err| match err {
         AdminProviderOpsExecuteJsonError::InvalidJson(message)
         | AdminProviderOpsExecuteJsonError::Transport(message) => message,
     });
-    let subscription_result = subscription_result.map_err(|err| match err {
-        AdminProviderOpsExecuteJsonError::InvalidJson(message)
-        | AdminProviderOpsExecuteJsonError::Transport(message) => message,
-    });
+    let subscription_result = subscription_result.map_err(json_execution_error_message);
+    let progress_result = progress_result.map_err(json_execution_error_message);
     let response_time_ms = Some(start.elapsed().as_millis() as u64);
 
     let (me_status, me_json) = match me_result {
@@ -161,10 +200,33 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
         );
     }
 
-    let subscription_json = subscription_result
-        .ok()
-        .and_then(|(status, payload)| (status == http::StatusCode::OK).then_some(payload));
-    let data =
+    let (subscription_json, subscription_failure) = match subscription_result {
+        Ok((status, payload)) if status == http::StatusCode::OK => (Some(payload), None),
+        Ok((status, _)) => (
+            None,
+            Some(format!(
+                "Sub2API 套餐摘要请求失败: HTTP {}",
+                status.as_u16()
+            )),
+        ),
+        Err(message) => (None, Some(network_error_message(&message))),
+    };
+    // Progress is enrichment only: summary still authoritatively classifies an
+    // unlimited or missing Group when this endpoint is unavailable. A limited
+    // subscription will fail closed later because its window cannot be proven.
+    let (progress_json, progress_warning) = match progress_result {
+        Ok(Some((status, payload))) if status == http::StatusCode::OK => (Some(payload), None),
+        Ok(Some((status, _))) => (
+            None,
+            Some(format!(
+                "Sub2API 套餐进度请求失败: HTTP {}",
+                status.as_u16()
+            )),
+        ),
+        Err(message) => (None, Some(network_error_message(&message))),
+        Ok(None) => (None, None),
+    };
+    let mut data =
         match parse_sub2api_balance_payload(action_config, &me_json, subscription_json.as_ref()) {
             Ok(data) => data,
             Err(message) => {
@@ -181,6 +243,43 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
             }
         };
 
+    if let Some(remote_quota_config) = remote_quota_config {
+        let remote_subscription = subscription_json
+            .as_ref()
+            .and_then(|payload| parse_sub2api_remote_quota_groups(payload).ok())
+            .and_then(|groups| {
+                groups
+                    .into_iter()
+                    .find(|group| group.group_id == remote_quota_config.group_id)
+            });
+        let mut sync_status = if let Some(message) = subscription_failure {
+            remote_quota_failed_keep_local(message, progress_warning)
+        } else if let Some(subscription_json) = subscription_json.as_ref() {
+            match parse_sub2api_remote_quota(
+                subscription_json,
+                progress_json.as_ref(),
+                remote_quota_config.group_id.as_str(),
+            ) {
+                Ok(snapshot) => match apply_remote_quota(state, provider_id, snapshot).await {
+                    Ok(mut status) => {
+                        if let Some(warning) = progress_warning {
+                            status["warning"] = Value::String(warning);
+                        }
+                        status
+                    }
+                    Err(message) => remote_quota_failed_keep_local(message, progress_warning),
+                },
+                Err(message) => remote_quota_failed_keep_local(message, progress_warning),
+            }
+        } else {
+            remote_quota_failed_keep_local("Sub2API 套餐摘要响应缺失".to_string(), progress_warning)
+        };
+        if let Some(remote_subscription) = remote_subscription {
+            sync_status["subscription"] = json!(remote_subscription);
+        }
+        attach_remote_quota_sync_status(&mut data, sync_status);
+    }
+
     admin_provider_ops_action_response(
         "success",
         "query_balance",
@@ -189,6 +288,165 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
         response_time_ms,
         86400,
     )
+}
+
+async fn apply_remote_quota(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    snapshot: Sub2ApiRemoteQuotaSnapshot,
+) -> Result<Value, String> {
+    let kill_switch = state
+        .app()
+        .read_system_config_json_value("enable_provider_remote_quota_sync")
+        .await
+        .map_err(|error| format!("读取远程额度同步开关失败: {}", error.into_message()))?;
+    if !system_config_bool(kill_switch.as_ref(), true) {
+        return Ok(json!({
+            "status": "skipped_kill_switch",
+            "message": "远程额度同步已被全局开关暂停，本地额度保持不变"
+        }));
+    }
+    let observed_at = chrono::Utc::now().timestamp().max(1) as u64;
+    let (patch, detail) = match snapshot {
+        Sub2ApiRemoteQuotaSnapshot::ActiveLimited {
+            group_id,
+            group_name,
+            subscription_id,
+            window,
+            limit_usd,
+            used_usd,
+            window_start_unix_secs,
+            resets_at_unix_secs,
+            expires_at_unix_secs,
+        } => (
+            ApplyRemoteProviderQuotaPatch {
+                provider_id: provider_id.to_string(),
+                billing_type: "monthly_quota".to_string(),
+                monthly_quota_usd: Some(limit_usd),
+                remote_monthly_used_usd: used_usd,
+                remote_window_start_unix_secs: window_start_unix_secs,
+                remote_window_end_unix_secs: resets_at_unix_secs,
+                quota_reset_day: Some(window.interval_days()),
+                quota_expires_at_unix_secs: expires_at_unix_secs,
+            },
+            json!({
+                "group_id": group_id,
+                "group_name": group_name,
+                "subscription_id": subscription_id,
+                "classification": "active_limited",
+                "window": window.as_str(),
+                "limit_usd": limit_usd,
+                "remote_used_usd": used_usd,
+                "window_start_unix_secs": window_start_unix_secs,
+                "resets_at_unix_secs": resets_at_unix_secs,
+                "expires_at_unix_secs": expires_at_unix_secs,
+            }),
+        ),
+        Sub2ApiRemoteQuotaSnapshot::ActiveUnlimited {
+            group_id,
+            group_name,
+            subscription_id,
+            expires_at_unix_secs,
+        } => (
+            ApplyRemoteProviderQuotaPatch {
+                provider_id: provider_id.to_string(),
+                billing_type: "pay_as_you_go".to_string(),
+                monthly_quota_usd: None,
+                remote_monthly_used_usd: 0.0,
+                remote_window_start_unix_secs: observed_at,
+                remote_window_end_unix_secs: observed_at.saturating_add(1),
+                quota_reset_day: None,
+                quota_expires_at_unix_secs: expires_at_unix_secs,
+            },
+            json!({
+                "group_id": group_id,
+                "group_name": group_name,
+                "subscription_id": subscription_id,
+                "classification": "active_unlimited",
+                "expires_at_unix_secs": expires_at_unix_secs,
+            }),
+        ),
+        Sub2ApiRemoteQuotaSnapshot::Exhausted { group_id } => (
+            ApplyRemoteProviderQuotaPatch {
+                provider_id: provider_id.to_string(),
+                billing_type: "monthly_quota".to_string(),
+                monthly_quota_usd: Some(0.0),
+                remote_monthly_used_usd: 0.0,
+                remote_window_start_unix_secs: observed_at,
+                remote_window_end_unix_secs: observed_at.saturating_add(1),
+                quota_reset_day: None,
+                quota_expires_at_unix_secs: None,
+            },
+            json!({
+                "group_id": group_id,
+                "classification": "exhausted",
+            }),
+        ),
+    };
+    let outcome = state
+        .app()
+        .apply_remote_provider_quota(&patch)
+        .await
+        .map_err(|error| format!("写入本地 Provider 配额失败: {}", error.into_message()))?;
+    match outcome {
+        ApplyRemoteProviderQuotaOutcome::Applied(local) => Ok(json!({
+            "status": "applied",
+            "remote": detail,
+            "local": {
+                "billing_type": local.billing_type,
+                "monthly_quota_usd": local.monthly_quota_usd,
+                "monthly_used_usd": local.monthly_used_usd,
+                "quota_last_reset_at_unix_secs": local.quota_last_reset_at_unix_secs,
+                "quota_expires_at_unix_secs": local.quota_expires_at_unix_secs,
+            }
+        })),
+        ApplyRemoteProviderQuotaOutcome::StaleWindow(local) => Ok(json!({
+            "status": "stale_window",
+            "message": "远程套餐窗口早于本地已同步窗口，本地额度保持不变",
+            "remote": detail,
+            "local": {
+                "billing_type": local.billing_type,
+                "monthly_quota_usd": local.monthly_quota_usd,
+                "monthly_used_usd": local.monthly_used_usd,
+                "quota_last_reset_at_unix_secs": local.quota_last_reset_at_unix_secs,
+                "quota_expires_at_unix_secs": local.quota_expires_at_unix_secs,
+            }
+        })),
+        ApplyRemoteProviderQuotaOutcome::ProviderNotFound => {
+            Err("写入本地 Provider 配额失败: Provider 不存在".to_string())
+        }
+    }
+}
+
+fn attach_remote_quota_sync_status(data: &mut Value, status: Value) {
+    let Some(data) = data.as_object_mut() else {
+        return;
+    };
+    let extra = data
+        .entry("extra")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    if let Some(extra) = extra {
+        extra.insert("remote_quota_sync".to_string(), status);
+    }
+}
+
+fn remote_quota_failed_keep_local(message: String, warning: Option<String>) -> Value {
+    let mut status = json!({
+        "status": "failed_keep_local",
+        "message": message,
+    });
+    if let Some(warning) = warning {
+        status["warning"] = Value::String(warning);
+    }
+    status
+}
+
+fn json_execution_error_message(error: AdminProviderOpsExecuteJsonError) -> String {
+    match error {
+        AdminProviderOpsExecuteJsonError::InvalidJson(message)
+        | AdminProviderOpsExecuteJsonError::Transport(message) => message,
+    }
 }
 
 fn network_error_message(error: &str) -> String {

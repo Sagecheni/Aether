@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 
 use aether_data_contracts::repository::quota::{
-    ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
+    ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository,
+    ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
 use aether_data_query::{DialectSql, SelectColumn, SelectQuery, SqlDialect};
 
@@ -120,6 +121,81 @@ WHERE billing_type = 'monthly_quota'
         .rows_affected();
         Ok(usize::try_from(rows_affected).unwrap_or_default())
     }
+
+    async fn apply_remote_provider_quota(
+        &self,
+        patch: &ApplyRemoteProviderQuotaPatch,
+    ) -> Result<ApplyRemoteProviderQuotaOutcome, DataLayerError> {
+        patch.validate()?;
+        let window_start = i64::try_from(patch.remote_window_start_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput("remote quota window is too large".to_string())
+        })?;
+        let window_end = i64::try_from(patch.remote_window_end_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput("remote quota window is too large".to_string())
+        })?;
+        let expires_at = patch
+            .quota_expires_at_unix_secs
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
+            })?;
+        let now = chrono::Utc::now().timestamp().max(0);
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE providers
+SET billing_type = ?,
+    monthly_quota_usd = ?,
+    monthly_used_usd = CASE
+        WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
+            THEN MAX(COALESCE(monthly_used_usd, 0), ?)
+        ELSE ?
+    END,
+    quota_reset_day = ?,
+    quota_last_reset_at = ?,
+    quota_expires_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND (quota_last_reset_at IS NULL OR quota_last_reset_at < ?)
+            "#,
+        )
+        .bind(&patch.billing_type)
+        .bind(patch.monthly_quota_usd)
+        .bind(window_start)
+        .bind(window_end)
+        .bind(patch.remote_monthly_used_usd)
+        .bind(patch.remote_monthly_used_usd)
+        .bind(patch.quota_reset_day.map(|days| days as i64))
+        .bind(window_start)
+        .bind(expires_at)
+        .bind(now)
+        .bind(patch.provider_id.trim())
+        .bind(window_end)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+
+        let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
+        if rows_affected == 0 {
+            return Ok(match stored {
+                Some(snapshot)
+                    if snapshot
+                        .quota_last_reset_at_unix_secs
+                        .is_some_and(|start| start >= patch.remote_window_end_unix_secs) =>
+                {
+                    ApplyRemoteProviderQuotaOutcome::StaleWindow(snapshot)
+                }
+                Some(snapshot) => ApplyRemoteProviderQuotaOutcome::Applied(snapshot),
+                None => ApplyRemoteProviderQuotaOutcome::ProviderNotFound,
+            });
+        }
+        stored
+            .map(ApplyRemoteProviderQuotaOutcome::Applied)
+            .ok_or_else(|| {
+                DataLayerError::UnexpectedValue("applied remote quota disappeared".to_string())
+            })
+    }
 }
 
 fn map_row(row: &SqliteRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError> {
@@ -139,6 +215,7 @@ fn map_row(row: &SqliteRow) -> Result<StoredProviderQuotaSnapshot, DataLayerErro
 mod tests {
     use super::SqliteProviderQuotaRepository;
     use aether_data_contracts::repository::quota::{
+        ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
         ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
     };
 
@@ -195,6 +272,53 @@ mod tests {
             .expect("quota should exist");
         assert_eq!(quota.monthly_used_usd, 0.0);
         assert_eq!(quota.quota_last_reset_at_unix_secs, Some(605_800));
+
+        let initial_remote = ApplyRemoteProviderQuotaPatch {
+            provider_id: "provider-1".to_string(),
+            billing_type: "monthly_quota".to_string(),
+            monthly_quota_usd: Some(100.0),
+            remote_monthly_used_usd: 3.0,
+            remote_window_start_unix_secs: 700_000,
+            remote_window_end_unix_secs: 800_000,
+            quota_reset_day: Some(30),
+            quota_expires_at_unix_secs: Some(900_000),
+        };
+        repository
+            .apply_remote_provider_quota(&initial_remote)
+            .await
+            .expect("remote quota should apply");
+        repository
+            .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                remote_monthly_used_usd: 2.0,
+                ..initial_remote.clone()
+            })
+            .await
+            .expect("same remote window should apply");
+        let quota = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should reload")
+            .expect("quota should exist");
+        assert_eq!(quota.monthly_quota_usd, Some(100.0));
+        assert_eq!(quota.monthly_used_usd, 3.0);
+        assert_eq!(quota.quota_reset_day, Some(30));
+
+        repository
+            .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                remote_monthly_used_usd: 1.0,
+                remote_window_start_unix_secs: 800_000,
+                remote_window_end_unix_secs: 900_000,
+                ..initial_remote.clone()
+            })
+            .await
+            .expect("new remote window should apply");
+        assert!(matches!(
+            repository
+                .apply_remote_provider_quota(&initial_remote)
+                .await
+                .expect("stale remote window should classify"),
+            ApplyRemoteProviderQuotaOutcome::StaleWindow(_)
+        ));
     }
 
     async fn seed_provider_quotas(pool: &sqlx::SqlitePool) {
