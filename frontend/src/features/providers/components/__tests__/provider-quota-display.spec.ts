@@ -4,7 +4,7 @@ import { createApp, defineComponent, h } from 'vue'
 import ProviderMonthlyQuotaCard from '@/features/providers/components/ProviderMonthlyQuotaCard.vue'
 import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQuotaProgressRow.vue'
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
-import { createI18n } from '@/i18n'
+import { createI18n, setI18nLocale } from '@/i18n'
 
 function mount(component: Parameters<typeof createApp>[0], props?: Record<string, unknown>) {
   const root = document.createElement('div')
@@ -23,17 +23,91 @@ function mount(component: Parameters<typeof createApp>[0], props?: Record<string
 }
 
 describe('provider quota display components', () => {
-  it('renders monthly quota usage and reset day', () => {
+  it('renders quota usage and the interval-day reset semantics', () => {
+    setI18nLocale('zh-CN')
     const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
       used: 25,
       quota: 100,
-      resetDay: 15,
+      resetIntervalDays: 15,
     })
 
     expect(root.querySelector('[data-testid="provider-monthly-quota-card"]')).toBeTruthy()
     expect(root.querySelector('[data-testid="provider-monthly-quota-percent"]')?.textContent).toContain('25.0%')
     expect(root.querySelector('[data-testid="provider-monthly-quota-amount"]')?.textContent).toContain('$25.00 / $100.00')
-    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent).toContain('15')
+    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent?.trim()).toBe('每 15 天重置')
+    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent).not.toContain('每月')
+
+    unmount()
+  })
+
+  it('shows every Sub2API subscription window and marks the locally synced one', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      resetIntervalDays: 1,
+      remoteQuotaGroup: {
+        group_id: '42',
+        group_name: 'Pro',
+        subscription_id: '9',
+        daily_limit_usd: 10,
+        daily_used_usd: 2,
+        weekly_limit_usd: 50,
+        weekly_used_usd: 8,
+        monthly_limit_usd: 0,
+        monthly_used_usd: 0,
+        local_sync_window: 'daily',
+        expires_at_unix_secs: null,
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('日限额')
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('$2 / $10')
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('当前生效')
+    expect(root.querySelector('[data-testid="provider-remote-quota-weekly"]')?.textContent).toContain('$8 / $50')
+    expect(root.querySelector('[data-testid="provider-remote-quota-monthly"]')?.textContent).toContain('不限')
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('日限额 · 每日重置')
+    expect(root.textContent).not.toContain('Group ID')
+
+    unmount()
+  })
+
+  it('shows an all-unlimited remote subscription even without a local quota amount', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      quota: 0,
+      remoteQuotaGroup: {
+        group_id: '42',
+        group_name: 'Unlimited',
+        subscription_id: '9',
+        daily_limit_usd: 0,
+        daily_used_usd: 0,
+        weekly_limit_usd: 0,
+        weekly_used_usd: 0,
+        monthly_limit_usd: 0,
+        monthly_used_usd: 0,
+        local_sync_window: null,
+        expires_at_unix_secs: null,
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-monthly-quota-card"]')).toBeTruthy()
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('不限')
+    expect(root.querySelector('[data-testid="provider-remote-quota-weekly"]')?.textContent).toContain('不限')
+    expect(root.querySelector('[data-testid="provider-remote-quota-monthly"]')?.textContent).toContain('不限')
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')?.textContent).toContain('日、周、月均不限')
+    expect(root.textContent).not.toContain('当前生效')
+
+    unmount()
+  })
+
+  it('labels a one-day reset interval as daily', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      used: 2,
+      quota: 10,
+      resetIntervalDays: 1,
+    })
+
+    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent?.trim()).toBe('每日重置')
 
     unmount()
   })

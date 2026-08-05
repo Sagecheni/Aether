@@ -50,10 +50,11 @@
             <div class="space-y-6 p-4 sm:p-6">
               <!-- 配额使用情况 -->
               <ProviderMonthlyQuotaCard
-                v-if="provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd"
+                v-if="remoteQuotaGroup || (provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd)"
                 :used="provider.monthly_used_usd"
                 :quota="provider.monthly_quota_usd"
-                :reset-day="provider.quota_reset_day"
+                :reset-interval-days="provider.quota_reset_day"
+                :remote-quota-group="remoteQuotaGroup"
               />
 
               <!-- 密钥管理 -->
@@ -963,6 +964,7 @@ import {
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
+import type { Sub2ApiRemoteQuotaGroup } from '@/api/providerOps'
 import {
   KeyFormDialog,
   KeyAllowedModelsEditDialog,
@@ -1068,6 +1070,7 @@ interface Props {
   providerId: string | null
   open: boolean
   initialProvider?: ProviderWithEndpointsSummary | null
+  remoteQuotaGroup?: Sub2ApiRemoteQuotaGroup | null
 }
 
 const props = defineProps<Props>()

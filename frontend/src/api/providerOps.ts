@@ -133,6 +133,28 @@ export interface QuotaAlertConfig {
   fetch_interval_seconds: number
 }
 
+export interface RemoteQuotaConfig {
+  enabled: boolean
+  group_id: string | null
+  progress_endpoint: string
+}
+
+export type Sub2ApiQuotaWindow = 'daily' | 'weekly' | 'monthly'
+
+export interface Sub2ApiRemoteQuotaGroup {
+  group_id: string
+  group_name: string
+  subscription_id: string
+  daily_limit_usd: number
+  daily_used_usd: number
+  weekly_limit_usd: number
+  weekly_used_usd: number
+  monthly_limit_usd: number
+  monthly_used_usd: number
+  local_sync_window: Sub2ApiQuotaWindow | null
+  expires_at_unix_secs: number | null
+}
+
 export interface SaveConfigRequest {
   architecture_id: string
   base_url?: string
@@ -140,6 +162,7 @@ export interface SaveConfigRequest {
   actions: Record<string, ActionConfigRequest>
   schedule: Record<string, string>
   quota_alert?: QuotaAlertConfig
+  remote_quota?: RemoteQuotaConfig
 }
 
 /** 连接请求 */
@@ -198,6 +221,7 @@ export interface ProviderOpsConfigResponse {
     credentials: Record<string, unknown>
   }
   quota_alert?: QuotaAlertConfig
+  remote_quota?: RemoteQuotaConfig
 }
 
 /**
@@ -319,11 +343,11 @@ export async function checkin(providerId: string): Promise<ActionResultResponse>
  * 批量查询余额
  */
 export async function batchQueryBalance(
-  providerIds?: string[]
+  providerIds?: string[],
 ): Promise<Record<string, ActionResultResponse>> {
   const response = await client.post<Record<string, ActionResultResponse>>(
     `${BASE_URL}/batch/balance`,
-    providerIds
+    providerIds,
   )
   return response.data
 }
@@ -335,6 +359,7 @@ export interface VerifyAuthRequest {
   connector: ConnectorConfigRequest
   actions?: Record<string, ActionConfigRequest>
   schedule?: Record<string, string>
+  discover_sub2api_groups?: boolean
 }
 
 /** 验证认证响应 */
@@ -348,7 +373,9 @@ export interface VerifyAuthResponse {
     quota?: number
     used_quota?: number
     request_count?: number
-    extra?: Record<string, unknown>
+    extra?: Record<string, unknown> & {
+      sub2api_groups?: Sub2ApiRemoteQuotaGroup[]
+    }
   }
   updated_credentials?: Record<string, unknown>
 }
@@ -366,4 +393,14 @@ export async function verifyProviderAuth(
     config
   )
   return response.data
+}
+
+export async function discoverSub2ApiGroups(
+  providerId: string,
+  config: VerifyAuthRequest
+): Promise<VerifyAuthResponse> {
+  return verifyProviderAuth(providerId, {
+    ...config,
+    discover_sub2api_groups: true,
+  })
 }
