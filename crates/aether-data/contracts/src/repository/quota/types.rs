@@ -85,6 +85,32 @@ pub enum ApplyRemoteProviderQuotaOutcome {
     ProviderNotFound,
 }
 
+impl ApplyRemoteProviderQuotaOutcome {
+    /// Classify a zero-row remote quota UPDATE.
+    ///
+    /// Only a strictly newer local window is `StaleWindow`. Any other surviving
+    /// row means the WRITE path failed closed and must not be reported as applied.
+    pub fn from_unapplied_row(
+        stored: Option<StoredProviderQuotaSnapshot>,
+        remote_window_end_unix_secs: u64,
+    ) -> Result<Self, crate::DataLayerError> {
+        match stored {
+            Some(snapshot)
+                if snapshot
+                    .quota_last_reset_at_unix_secs
+                    .is_some_and(|start| start >= remote_window_end_unix_secs) =>
+            {
+                Ok(Self::StaleWindow(snapshot))
+            }
+            Some(_) => Err(crate::DataLayerError::UnexpectedValue(
+                "remote provider quota update matched no row without a newer local window"
+                    .to_string(),
+            )),
+            None => Ok(Self::ProviderNotFound),
+        }
+    }
+}
+
 impl StoredProviderQuotaSnapshot {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -151,4 +177,51 @@ pub trait ProviderQuotaRepository:
 impl<T> ProviderQuotaRepository for T where
     T: ProviderQuotaReadRepository + ProviderQuotaWriteRepository + Send + Sync
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplyRemoteProviderQuotaOutcome, StoredProviderQuotaSnapshot};
+
+    fn sample_quota(last_reset: Option<i64>) -> StoredProviderQuotaSnapshot {
+        StoredProviderQuotaSnapshot::new(
+            "provider-1".to_string(),
+            "monthly_quota".to_string(),
+            Some(100.0),
+            4.0,
+            Some(30),
+            last_reset,
+            None,
+            true,
+        )
+        .expect("quota should build")
+    }
+
+    #[test]
+    fn unapplied_row_classifies_stale_and_missing_only() {
+        assert!(matches!(
+            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(None, 8_000)
+                .expect("missing provider is an outcome"),
+            ApplyRemoteProviderQuotaOutcome::ProviderNotFound
+        ));
+        assert!(matches!(
+            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
+                Some(sample_quota(Some(8_000))),
+                8_000
+            )
+            .expect("newer-or-equal local window is stale"),
+            ApplyRemoteProviderQuotaOutcome::StaleWindow(_)
+        ));
+        let error = ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
+            Some(sample_quota(Some(1_000))),
+            8_000,
+        )
+        .expect_err("non-stale zero-row must not look applied");
+        assert!(
+            error
+                .to_string()
+                .contains("matched no row without a newer local window"),
+            "unexpected error: {error}"
+        );
+    }
 }

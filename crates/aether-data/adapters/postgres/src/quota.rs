@@ -178,17 +178,10 @@ WHERE id = $1
 
         let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
         if result.rows_affected() == 0 {
-            return Ok(match stored {
-                Some(snapshot)
-                    if snapshot
-                        .quota_last_reset_at_unix_secs
-                        .is_some_and(|start| start >= patch.remote_window_end_unix_secs) =>
-                {
-                    ApplyRemoteProviderQuotaOutcome::StaleWindow(snapshot)
-                }
-                Some(snapshot) => ApplyRemoteProviderQuotaOutcome::Applied(snapshot),
-                None => ApplyRemoteProviderQuotaOutcome::ProviderNotFound,
-            });
+            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
+                stored,
+                patch.remote_window_end_unix_secs,
+            );
         }
         stored
             .map(ApplyRemoteProviderQuotaOutcome::Applied)
