@@ -347,41 +347,49 @@ async fn apply_remote_quota(
             group_name,
             subscription_id,
             expires_at_unix_secs,
-        } => (
-            ApplyRemoteProviderQuotaPatch {
-                provider_id: provider_id.to_string(),
-                billing_type: "pay_as_you_go".to_string(),
-                monthly_quota_usd: None,
-                remote_monthly_used_usd: 0.0,
-                remote_window_start_unix_secs: observed_at,
-                remote_window_end_unix_secs: observed_at.saturating_add(1),
-                quota_reset_day: None,
-                quota_expires_at_unix_secs: expires_at_unix_secs,
-            },
-            json!({
-                "group_id": group_id,
-                "group_name": group_name,
-                "subscription_id": subscription_id,
-                "classification": "active_unlimited",
-                "expires_at_unix_secs": expires_at_unix_secs,
-            }),
-        ),
-        Sub2ApiRemoteQuotaSnapshot::Exhausted { group_id } => (
-            ApplyRemoteProviderQuotaPatch {
-                provider_id: provider_id.to_string(),
-                billing_type: "monthly_quota".to_string(),
-                monthly_quota_usd: Some(0.0),
-                remote_monthly_used_usd: 0.0,
-                remote_window_start_unix_secs: observed_at,
-                remote_window_end_unix_secs: observed_at.saturating_add(1),
-                quota_reset_day: None,
-                quota_expires_at_unix_secs: None,
-            },
-            json!({
-                "group_id": group_id,
-                "classification": "exhausted",
-            }),
-        ),
+        } => {
+            // 状态覆盖，用量保留：unlimited 不代表本地已用量归零。
+            let local_used_usd = current_local_used_usd(state, provider_id).await?;
+            (
+                ApplyRemoteProviderQuotaPatch {
+                    provider_id: provider_id.to_string(),
+                    billing_type: "pay_as_you_go".to_string(),
+                    monthly_quota_usd: None,
+                    remote_monthly_used_usd: local_used_usd,
+                    remote_window_start_unix_secs: observed_at,
+                    remote_window_end_unix_secs: observed_at.saturating_add(1),
+                    quota_reset_day: None,
+                    quota_expires_at_unix_secs: expires_at_unix_secs,
+                },
+                json!({
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "subscription_id": subscription_id,
+                    "classification": "active_unlimited",
+                    "expires_at_unix_secs": expires_at_unix_secs,
+                }),
+            )
+        }
+        Sub2ApiRemoteQuotaSnapshot::Exhausted { group_id } => {
+            // 状态覆盖，用量保留：套餐缺失不代表本地已用量归零。
+            let local_used_usd = current_local_used_usd(state, provider_id).await?;
+            (
+                ApplyRemoteProviderQuotaPatch {
+                    provider_id: provider_id.to_string(),
+                    billing_type: "monthly_quota".to_string(),
+                    monthly_quota_usd: Some(0.0),
+                    remote_monthly_used_usd: local_used_usd,
+                    remote_window_start_unix_secs: observed_at,
+                    remote_window_end_unix_secs: observed_at.saturating_add(1),
+                    quota_reset_day: None,
+                    quota_expires_at_unix_secs: None,
+                },
+                json!({
+                    "group_id": group_id,
+                    "classification": "exhausted",
+                }),
+            )
+        }
     };
     let outcome = state
         .app()
@@ -440,6 +448,19 @@ fn remote_quota_failed_keep_local(message: String, warning: Option<String>) -> V
         status["warning"] = Value::String(warning);
     }
     status
+}
+
+async fn current_local_used_usd(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+) -> Result<f64, String> {
+    state
+        .app()
+        .read_provider_quota_snapshot(provider_id)
+        .await
+        .map_err(|error| format!("读取本地 Provider 配额失败: {}", error.into_message()))?
+        .map(|snapshot| snapshot.monthly_used_usd)
+        .ok_or_else(|| "读取本地 Provider 配额失败: Provider 不存在".to_string())
 }
 
 fn json_execution_error_message(error: AdminProviderOpsExecuteJsonError) -> String {
