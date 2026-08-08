@@ -70,6 +70,49 @@ describe('provider quota display components', () => {
     unmount()
   })
 
+  it('does not label a remote window active when the latest apply failed', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      remoteQuotaEnabled: true,
+      resetIntervalDays: 1,
+      remoteQuotaGroup: {
+        group_id: '42',
+        group_name: 'Pro',
+        subscription_id: '9',
+        daily_limit_usd: 10,
+        daily_used_usd: 2,
+        weekly_limit_usd: 50,
+        weekly_used_usd: 8,
+        monthly_limit_usd: 0,
+        monthly_used_usd: 0,
+        local_sync_window: 'daily',
+        expires_at_unix_secs: null,
+        sync_status: 'failed_keep_local',
+        sync_message: 'progress 数据缺失',
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).not.toContain('当前生效')
+    expect(root.querySelector('[data-testid="provider-remote-quota-sync-warning"]')?.textContent).toContain('progress 数据缺失')
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')).toBeNull()
+
+    unmount()
+  })
+
+  it('shows an exhausted remote subscription without an active Group snapshot', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      billingType: 'monthly_quota',
+      quota: 0,
+      remoteQuotaEnabled: true,
+    })
+
+    expect(root.querySelector('[data-testid="provider-monthly-quota-card"]')).toBeTruthy()
+    expect(root.querySelector('[data-testid="provider-remote-quota-fallback"]')?.textContent).toContain('额度已用尽')
+
+    unmount()
+  })
+
   it('shows an all-unlimited remote subscription even without a local quota amount', () => {
     setI18nLocale('zh-CN')
     const { root, unmount } = mount(ProviderMonthlyQuotaCard, {

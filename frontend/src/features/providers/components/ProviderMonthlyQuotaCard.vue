@@ -1,6 +1,6 @@
 <template>
   <Card
-    v-if="remoteQuotaGroup || quota > 0"
+    v-if="remoteQuotaEnabled || remoteQuotaGroup || quota > 0"
     class="p-4"
     data-testid="provider-monthly-quota-card"
   >
@@ -18,7 +18,7 @@
           </p>
         </div>
         <Badge
-          v-if="!remoteQuotaGroup"
+          v-if="!remoteQuotaEnabled && !remoteQuotaGroup"
           variant="secondary"
           class="text-xs"
           data-testid="provider-monthly-quota-percent"
@@ -40,7 +40,7 @@
                 {{ remoteWindowLabel(window.key) }}
               </span>
               <Badge
-                v-if="remoteQuotaGroup.local_sync_window === window.key"
+                v-if="remoteQuotaApplied && remoteQuotaGroup.local_sync_window === window.key"
                 variant="secondary"
                 class="px-1.5 py-0 text-[10px]"
               >
@@ -65,7 +65,10 @@
           </div>
         </div>
 
-        <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <div
+          v-if="remoteQuotaApplied"
+          class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-muted-foreground"
+        >
           <span data-testid="provider-remote-quota-local-window">
             <template v-if="remoteQuotaGroup.local_sync_window">
               {{ remoteWindowLabel(remoteQuotaGroup.local_sync_window) }}
@@ -79,7 +82,39 @@
             {{ remoteQuotaExpiresText }}
           </span>
         </div>
+        <p
+          v-else
+          data-testid="provider-remote-quota-sync-warning"
+          class="text-xs text-amber-600 dark:text-amber-400"
+        >
+          {{ remoteQuotaGroup.sync_message || t('providers.quota.syncNotApplied') }}
+        </p>
       </template>
+
+      <div
+        v-else-if="remoteQuotaEnabled"
+        data-testid="provider-remote-quota-fallback"
+        class="rounded-lg border border-border/70 bg-muted/20 p-3 text-sm"
+      >
+        <p
+          v-if="remoteQuotaFallbackState === 'exhausted'"
+          class="font-medium text-red-600 dark:text-red-400"
+        >
+          {{ t('providers.quota.exhausted') }}
+        </p>
+        <p
+          v-else-if="remoteQuotaFallbackState === 'limited'"
+          class="font-semibold tabular-nums"
+        >
+          {{ t('providers.quota.retainedLocal') }}: ${{ used.toFixed(2) }} / ${{ quota.toFixed(2) }}
+        </p>
+        <p
+          v-else
+          class="text-muted-foreground"
+        >
+          {{ t('providers.quota.awaitingSync') }}
+        </p>
+      </div>
 
       <template v-else>
         <div class="relative h-2 w-full overflow-hidden rounded-full bg-border">
@@ -124,11 +159,15 @@ const props = withDefaults(defineProps<{
   used?: number | null
   quota?: number | null
   resetIntervalDays?: number | null
+  billingType?: string | null
+  remoteQuotaEnabled?: boolean
   remoteQuotaGroup?: Sub2ApiRemoteQuotaGroup | null
 }>(), {
   used: 0,
   quota: 0,
   resetIntervalDays: null,
+  billingType: null,
+  remoteQuotaEnabled: false,
   remoteQuotaGroup: null,
 })
 
@@ -149,6 +188,14 @@ const resetIntervalText = computed(() => {
 const usedPercent = computed(() => quota.value > 0 ? (used.value / quota.value) * 100 : 0)
 const cappedUsedPercent = computed(() => Math.min(Math.max(usedPercent.value, 0), 100))
 const barClass = computed(() => ratioBarClass(quota.value > 0 ? used.value / quota.value : 0))
+const remoteQuotaApplied = computed(() => {
+  const status = props.remoteQuotaGroup?.sync_status
+  return status === undefined || status === 'applied'
+})
+const remoteQuotaFallbackState = computed<'limited' | 'exhausted' | 'pending'>(() => {
+  if (props.billingType !== 'monthly_quota') return 'pending'
+  return quota.value > 0 ? 'limited' : 'exhausted'
+})
 const remoteQuotaExpiresText = computed(() => {
   const expiresAt = props.remoteQuotaGroup?.expires_at_unix_secs
   if (!expiresAt) return ''

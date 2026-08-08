@@ -141,6 +141,12 @@ export interface RemoteQuotaConfig {
 
 export type Sub2ApiQuotaWindow = 'daily' | 'weekly' | 'monthly'
 
+export type RemoteQuotaSyncStatus =
+  | 'applied'
+  | 'skipped_kill_switch'
+  | 'failed_keep_local'
+  | 'stale_window'
+
 export interface Sub2ApiRemoteQuotaGroup {
   group_id: string
   group_name: string
@@ -153,6 +159,9 @@ export interface Sub2ApiRemoteQuotaGroup {
   monthly_used_usd: number
   local_sync_window: Sub2ApiQuotaWindow | null
   expires_at_unix_secs: number | null
+  /** Present on cached balance snapshots; discovery results do not carry apply state. */
+  sync_status?: RemoteQuotaSyncStatus
+  sync_message?: string | null
 }
 
 export interface SaveConfigRequest {

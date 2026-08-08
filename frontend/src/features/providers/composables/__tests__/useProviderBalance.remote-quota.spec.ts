@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import type { ActionResultResponse } from '@/api/providerOps'
+import type { ActionResultResponse, RemoteQuotaSyncStatus } from '@/api/providerOps'
 import { parseProviderRemoteQuotaGroup } from '../useProviderBalance'
 
-function resultWithSubscription(subscription: Record<string, unknown>): ActionResultResponse {
+function resultWithSubscription(
+  subscription: Record<string, unknown>,
+  status: RemoteQuotaSyncStatus = 'applied',
+  message?: string,
+): ActionResultResponse {
   return {
     status: 'success',
     action_type: 'query_balance',
@@ -11,7 +15,8 @@ function resultWithSubscription(subscription: Record<string, unknown>): ActionRe
       currency: 'USD',
       extra: {
         remote_quota_sync: {
-          status: 'applied',
+          status,
+          message,
           subscription,
         },
       },
@@ -47,6 +52,30 @@ describe('provider balance remote quota snapshot', () => {
       weekly_used_usd: 8,
       monthly_limit_usd: 0,
       local_sync_window: 'daily',
+      sync_status: 'applied',
+      sync_message: null,
+    })
+  })
+
+  it('keeps failed apply state attached to a valid remote subscription snapshot', () => {
+    const result = resultWithSubscription({
+      group_id: '42',
+      group_name: 'Pro',
+      subscription_id: '9',
+      daily_limit_usd: 10,
+      daily_used_usd: 2,
+      weekly_limit_usd: 50,
+      weekly_used_usd: 8,
+      monthly_limit_usd: 0,
+      monthly_used_usd: 0,
+      local_sync_window: 'daily',
+      expires_at_unix_secs: null,
+    }, 'failed_keep_local', 'progress 数据缺失')
+
+    expect(parseProviderRemoteQuotaGroup(result)).toMatchObject({
+      group_id: '42',
+      sync_status: 'failed_keep_local',
+      sync_message: 'progress 数据缺失',
     })
   })
 

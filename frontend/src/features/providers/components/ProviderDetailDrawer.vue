@@ -50,10 +50,12 @@
             <div class="space-y-6 p-4 sm:p-6">
               <!-- 配额使用情况 -->
               <ProviderMonthlyQuotaCard
-                v-if="remoteQuotaGroup || (provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd)"
+                v-if="provider.ops_remote_quota_enabled || remoteQuotaGroup || (provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd)"
                 :used="provider.monthly_used_usd"
                 :quota="provider.monthly_quota_usd"
                 :reset-interval-days="provider.quota_reset_day"
+                :billing-type="provider.billing_type"
+                :remote-quota-enabled="provider.ops_remote_quota_enabled"
                 :remote-quota-group="remoteQuotaGroup"
               />
 

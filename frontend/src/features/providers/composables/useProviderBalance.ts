@@ -5,6 +5,7 @@ import {
   getArchitectures,
   type ActionResultResponse,
   type ArchitectureInfo,
+  type RemoteQuotaSyncStatus,
   type Sub2ApiQuotaWindow,
   type Sub2ApiRemoteQuotaGroup,
 } from '@/api/providerOps'
@@ -39,6 +40,15 @@ function quotaWindowValue(value: unknown): Sub2ApiQuotaWindow | null {
   return value === 'daily' || value === 'weekly' || value === 'monthly' ? value : null
 }
 
+function remoteQuotaSyncStatus(value: unknown): RemoteQuotaSyncStatus | null {
+  return value === 'applied'
+    || value === 'skipped_kill_switch'
+    || value === 'failed_keep_local'
+    || value === 'stale_window'
+    ? value
+    : null
+}
+
 export function parseProviderRemoteQuotaGroup(
   result: ActionResultResponse | null | undefined,
 ): Sub2ApiRemoteQuotaGroup | null {
@@ -49,7 +59,8 @@ export function parseProviderRemoteQuotaGroup(
   const extra = asRecord(data.extra)
   const sync = asRecord(extra?.remote_quota_sync)
   const subscription = asRecord(sync?.subscription)
-  if (!subscription) return null
+  const syncStatus = remoteQuotaSyncStatus(sync?.status)
+  if (!subscription || !syncStatus) return null
 
   const groupId = stringValue(subscription.group_id)
   const subscriptionId = stringValue(subscription.subscription_id)
@@ -86,6 +97,8 @@ export function parseProviderRemoteQuotaGroup(
     monthly_used_usd: monthlyUsed,
     local_sync_window: localSyncWindow,
     expires_at_unix_secs: expiresAt,
+    sync_status: syncStatus,
+    sync_message: stringValue(sync?.message),
   }
 }
 
