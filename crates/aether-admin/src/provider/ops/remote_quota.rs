@@ -322,9 +322,11 @@ pub fn parse_sub2api_remote_quota(
         used_usd: summary_used_usd.max(progress_window.used_usd),
         window_start_unix_secs: progress_window.window_start_unix_secs,
         resets_at_unix_secs: progress_window.resets_at_unix_secs,
-        expires_at_unix_secs: progress
+        // Summary owns subscription identity and expiry; progress only enriches
+        // the selected quota window and usage.
+        expires_at_unix_secs: subscription
             .expires_at_unix_secs
-            .or(subscription.expires_at_unix_secs),
+            .or(progress.expires_at_unix_secs),
     })
 }
 
@@ -401,7 +403,12 @@ fn summary_limit_usd(
     let field = format!("{window}_limit_usd");
     optional_non_negative_f64(
         item.get(&field)
-            .or_else(|| group.and_then(|group| group.get(&field))),
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                group
+                    .and_then(|group| group.get(&field))
+                    .filter(|value| !value.is_null())
+            }),
         &field,
     )
     .map(|value| value.unwrap_or(0.0))
@@ -411,7 +418,9 @@ fn summary_used_usd(item: &Map<String, Value>, window: &str) -> Result<f64, Stri
     let used_field = format!("{window}_used_usd");
     let usage_field = format!("{window}_usage_usd");
     optional_non_negative_f64(
-        item.get(&used_field).or_else(|| item.get(&usage_field)),
+        item.get(&used_field)
+            .filter(|value| !value.is_null())
+            .or_else(|| item.get(&usage_field).filter(|value| !value.is_null())),
         &used_field,
     )
     .map(|value| value.unwrap_or(0.0))
@@ -682,6 +691,68 @@ mod tests {
             groups[0].local_sync_window,
             Some(Sub2ApiQuotaWindowKind::Daily)
         );
+    }
+
+    #[test]
+    fn falls_back_to_nested_limits_and_usage_aliases_when_flat_fields_are_null() {
+        let summary = json!({
+            "code": 0,
+            "data": {"subscriptions": [{
+                "id": 9,
+                "group_id": 42,
+                "status": "active",
+                "daily_limit_usd": null,
+                "daily_used_usd": null,
+                "daily_usage_usd": 2.5,
+                "group": {"daily_limit_usd": 10}
+            }]}
+        });
+
+        let groups = parse_sub2api_remote_quota_groups(&summary)
+            .expect("null flat fields should fall back to the nested contract");
+        assert_eq!(groups[0].daily_limit_usd, 10.0);
+        assert_eq!(groups[0].daily_used_usd, 2.5);
+    }
+
+    #[test]
+    fn summary_expiry_remains_authoritative_over_progress_enrichment() {
+        let summary = json!({
+            "code": 0,
+            "data": {"subscriptions": [{
+                "id": 9,
+                "group_id": 42,
+                "status": "active",
+                "monthly_limit_usd": 100,
+                "monthly_used_usd": 12,
+                "expires_at": "2030-02-01T00:00:00Z"
+            }]}
+        });
+        let progress = json!({
+            "code": 0,
+            "data": [{
+                "subscription": {"id": 9, "group_id": 42},
+                "progress": {
+                    "expires_at": "2040-02-01T00:00:00Z",
+                    "monthly": {
+                        "limit_usd": 100,
+                        "used_usd": 12,
+                        "window_start": "2030-01-01T00:00:00Z",
+                        "resets_at": "2030-01-31T00:00:00Z"
+                    }
+                }
+            }]
+        });
+
+        let parsed = parse_sub2api_remote_quota(&summary, Some(&progress), "42")
+            .expect("summary and progress should parse");
+        let Sub2ApiRemoteQuotaSnapshot::ActiveLimited {
+            expires_at_unix_secs,
+            ..
+        } = parsed
+        else {
+            panic!("expected a finite quota window");
+        };
+        assert_eq!(expires_at_unix_secs, Some(1_896_134_400));
     }
 
     #[test]

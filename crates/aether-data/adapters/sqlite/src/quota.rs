@@ -149,6 +149,7 @@ SET billing_type = ?,
     monthly_used_usd = CASE
         WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
             THEN MAX(COALESCE(monthly_used_usd, 0), ?)
+        WHEN ? THEN COALESCE(monthly_used_usd, 0)
         ELSE ?
     END,
     quota_reset_day = ?,
@@ -164,6 +165,7 @@ WHERE id = ?
         .bind(window_start)
         .bind(window_end)
         .bind(patch.remote_monthly_used_usd)
+        .bind(patch.preserve_local_used_usd)
         .bind(patch.remote_monthly_used_usd)
         .bind(patch.quota_reset_day.map(|days| days as i64))
         .bind(window_start)
@@ -178,10 +180,7 @@ WHERE id = ?
 
         let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
         if rows_affected == 0 {
-            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
-                stored,
-                patch.remote_window_end_unix_secs,
-            );
+            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(stored, patch);
         }
         stored
             .map(ApplyRemoteProviderQuotaOutcome::Applied)
@@ -275,6 +274,7 @@ mod tests {
             remote_window_end_unix_secs: 800_000,
             quota_reset_day: Some(30),
             quota_expires_at_unix_secs: Some(900_000),
+            preserve_local_used_usd: false,
         };
         repository
             .apply_remote_provider_quota(&initial_remote)
@@ -312,6 +312,24 @@ mod tests {
                 .expect("stale remote window should classify"),
             ApplyRemoteProviderQuotaOutcome::StaleWindow(_)
         ));
+
+        let preserve_local_usage = ApplyRemoteProviderQuotaPatch {
+            remote_monthly_used_usd: 0.0,
+            remote_window_start_unix_secs: 900_000,
+            remote_window_end_unix_secs: 1_000_000,
+            preserve_local_used_usd: true,
+            ..initial_remote.clone()
+        };
+        repository
+            .apply_remote_provider_quota(&preserve_local_usage)
+            .await
+            .expect("state-only remote quota update should apply");
+        let quota = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should reload")
+            .expect("quota should exist");
+        assert_eq!(quota.monthly_used_usd, 1.0);
     }
 
     async fn seed_provider_quotas(pool: &sqlx::SqlitePool) {

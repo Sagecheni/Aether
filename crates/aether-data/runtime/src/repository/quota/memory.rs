@@ -107,6 +107,8 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         quota.monthly_quota_usd = patch.monthly_quota_usd;
         quota.monthly_used_usd = if same_window {
             quota.monthly_used_usd.max(patch.remote_monthly_used_usd)
+        } else if patch.preserve_local_used_usd {
+            quota.monthly_used_usd
         } else {
             patch.remote_monthly_used_usd
         };
@@ -167,6 +169,7 @@ mod tests {
             remote_window_end_unix_secs: 8_000,
             quota_reset_day: Some(30),
             quota_expires_at_unix_secs: Some(9_000),
+            preserve_local_used_usd: false,
         };
         assert!(matches!(
             repository
@@ -209,6 +212,25 @@ mod tests {
             .expect("quota should exist");
         assert_eq!(stored.monthly_used_usd, 1.0);
         assert_eq!(stored.quota_last_reset_at_unix_secs, Some(8_000));
+
+        let preserve_local_usage = ApplyRemoteProviderQuotaPatch {
+            remote_monthly_used_usd: 0.0,
+            remote_window_start_unix_secs: 14_000,
+            remote_window_end_unix_secs: 20_000,
+            preserve_local_used_usd: true,
+            ..first.clone()
+        };
+        repository
+            .apply_remote_provider_quota(&preserve_local_usage)
+            .await
+            .expect("state-only remote quota update should succeed");
+        let stored = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should load")
+            .expect("quota should exist");
+        assert_eq!(stored.monthly_used_usd, 1.0);
+        assert_eq!(stored.quota_last_reset_at_unix_secs, Some(14_000));
 
         assert!(matches!(
             repository

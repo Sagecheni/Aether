@@ -22,6 +22,8 @@ pub struct ApplyRemoteProviderQuotaPatch {
     pub remote_window_end_unix_secs: u64,
     pub quota_reset_day: Option<u64>,
     pub quota_expires_at_unix_secs: Option<u64>,
+    /// Preserve the provider's current local usage when only quota state changes.
+    pub preserve_local_used_usd: bool,
 }
 
 impl ApplyRemoteProviderQuotaPatch {
@@ -86,28 +88,38 @@ pub enum ApplyRemoteProviderQuotaOutcome {
 }
 
 impl ApplyRemoteProviderQuotaOutcome {
-    /// Classify a zero-row remote quota UPDATE.
-    ///
-    /// Only a strictly newer local window is `StaleWindow`. Any other surviving
-    /// row means the WRITE path failed closed and must not be reported as applied.
+    /// Classify a zero-row remote quota UPDATE without mistaking an idempotent
+    /// write for success. A row is already applied only when all state fields
+    /// match and the usage monotonicity rule is satisfied.
     pub fn from_unapplied_row(
         stored: Option<StoredProviderQuotaSnapshot>,
-        remote_window_end_unix_secs: u64,
+        patch: &ApplyRemoteProviderQuotaPatch,
     ) -> Result<Self, crate::DataLayerError> {
-        match stored {
-            Some(snapshot)
-                if snapshot
-                    .quota_last_reset_at_unix_secs
-                    .is_some_and(|start| start >= remote_window_end_unix_secs) =>
-            {
-                Ok(Self::StaleWindow(snapshot))
-            }
-            Some(_) => Err(crate::DataLayerError::UnexpectedValue(
-                "remote provider quota update matched no row without a newer local window"
-                    .to_string(),
-            )),
-            None => Ok(Self::ProviderNotFound),
+        let Some(snapshot) = stored else {
+            return Ok(Self::ProviderNotFound);
+        };
+        if snapshot
+            .quota_last_reset_at_unix_secs
+            .is_some_and(|start| start >= patch.remote_window_end_unix_secs)
+        {
+            return Ok(Self::StaleWindow(snapshot));
         }
+
+        let already_applied = snapshot.quota_last_reset_at_unix_secs
+            == Some(patch.remote_window_start_unix_secs)
+            && snapshot.billing_type == patch.billing_type
+            && snapshot.monthly_quota_usd == patch.monthly_quota_usd
+            && snapshot.quota_reset_day == patch.quota_reset_day
+            && snapshot.quota_expires_at_unix_secs == patch.quota_expires_at_unix_secs
+            && (patch.preserve_local_used_usd
+                || snapshot.monthly_used_usd >= patch.remote_monthly_used_usd);
+        if already_applied {
+            return Ok(Self::Applied(snapshot));
+        }
+
+        Err(crate::DataLayerError::UnexpectedValue(
+            "remote provider quota update matched no row without a newer local window".to_string(),
+        ))
     }
 }
 
@@ -181,7 +193,9 @@ impl<T> ProviderQuotaRepository for T where
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyRemoteProviderQuotaOutcome, StoredProviderQuotaSnapshot};
+    use super::{
+        ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch, StoredProviderQuotaSnapshot,
+    };
 
     fn sample_quota(last_reset: Option<i64>) -> StoredProviderQuotaSnapshot {
         StoredProviderQuotaSnapshot::new(
@@ -197,24 +211,46 @@ mod tests {
         .expect("quota should build")
     }
 
+    fn patch() -> ApplyRemoteProviderQuotaPatch {
+        ApplyRemoteProviderQuotaPatch {
+            provider_id: "provider-1".to_string(),
+            billing_type: "monthly_quota".to_string(),
+            monthly_quota_usd: Some(100.0),
+            remote_monthly_used_usd: 4.0,
+            remote_window_start_unix_secs: 7_000,
+            remote_window_end_unix_secs: 8_000,
+            quota_reset_day: Some(30),
+            quota_expires_at_unix_secs: None,
+            preserve_local_used_usd: false,
+        }
+    }
+
     #[test]
-    fn unapplied_row_classifies_stale_and_missing_only() {
+    fn unapplied_row_classifies_stale_missing_idempotent_and_failed() {
         assert!(matches!(
-            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(None, 8_000)
+            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(None, &patch())
                 .expect("missing provider is an outcome"),
             ApplyRemoteProviderQuotaOutcome::ProviderNotFound
         ));
         assert!(matches!(
             ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
                 Some(sample_quota(Some(8_000))),
-                8_000
+                &patch(),
             )
             .expect("newer-or-equal local window is stale"),
             ApplyRemoteProviderQuotaOutcome::StaleWindow(_)
         ));
+        assert!(matches!(
+            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
+                Some(sample_quota(Some(7_000))),
+                &patch(),
+            )
+            .expect("an idempotent row is already applied"),
+            ApplyRemoteProviderQuotaOutcome::Applied(_)
+        ));
         let error = ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
             Some(sample_quota(Some(1_000))),
-            8_000,
+            &patch(),
         )
         .expect_err("non-stale zero-row must not look applied");
         assert!(

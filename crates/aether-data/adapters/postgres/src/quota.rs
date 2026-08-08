@@ -148,13 +148,14 @@ SET billing_type = CAST($2 AS providerbillingtype),
         WHEN CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) >= $4
              AND CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) < $5
             THEN GREATEST(COALESCE(monthly_used_usd, 0), $6)
-        ELSE $6
+        WHEN $7::boolean THEN COALESCE(monthly_used_usd, 0)
+        ELSE $8
     END,
-    quota_reset_day = $7,
+    quota_reset_day = $9,
     quota_last_reset_at = TO_TIMESTAMP($4::double precision),
     quota_expires_at = CASE
-        WHEN $8::bigint IS NULL THEN NULL
-        ELSE TO_TIMESTAMP($8::double precision)
+        WHEN $10::bigint IS NULL THEN NULL
+        ELSE TO_TIMESTAMP($10::double precision)
     END,
     updated_at = NOW()
 WHERE id = $1
@@ -170,6 +171,8 @@ WHERE id = $1
         .bind(window_start)
         .bind(window_end)
         .bind(patch.remote_monthly_used_usd)
+        .bind(patch.preserve_local_used_usd)
+        .bind(patch.remote_monthly_used_usd)
         .bind(patch.quota_reset_day.map(|days| days as i32))
         .bind(expires_at)
         .execute(&self.pool)
@@ -178,10 +181,7 @@ WHERE id = $1
 
         let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
         if result.rows_affected() == 0 {
-            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
-                stored,
-                patch.remote_window_end_unix_secs,
-            );
+            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(stored, patch);
         }
         stored
             .map(ApplyRemoteProviderQuotaOutcome::Applied)
