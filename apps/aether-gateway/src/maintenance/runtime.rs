@@ -98,7 +98,8 @@ pub(crate) use provider_quota_alert::{
     perform_provider_quota_alert_once, ProviderQuotaAlertRunSummary,
 };
 pub(crate) use provider_remote_quota::{
-    perform_provider_remote_quota_sync_once, ProviderRemoteQuotaSyncRunSummary,
+    perform_provider_remote_quota_sync_once, provider_remote_quota_sync_interval,
+    ProviderRemoteQuotaSyncRunSummary,
 };
 use proxy_node_metrics_cleanup::*;
 use proxy_node_staleness::*;
@@ -153,7 +154,6 @@ const PROVIDER_CHECKIN_CONCURRENCY: usize = 3;
 const PROVIDER_QUOTA_ALERT_CONCURRENCY: usize = 3;
 const PROVIDER_QUOTA_ALERT_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER_REMOTE_QUOTA_SYNC_CONCURRENCY: usize = 3;
-const PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PROVIDER_CHECKIN_DEFAULT_TIME: &str = "01:05";
 const REQUEST_CANDIDATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STATS_DAILY_AGGREGATION_HOUR: u32 = 0;

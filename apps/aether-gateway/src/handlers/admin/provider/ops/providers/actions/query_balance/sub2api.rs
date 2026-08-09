@@ -13,6 +13,7 @@ use aether_admin::provider::ops::{
     parse_sub2api_balance_payload, parse_sub2api_remote_quota, parse_sub2api_remote_quota_groups,
     validate_sub2api_same_origin_endpoint, Sub2ApiRemoteQuotaConfig, Sub2ApiRemoteQuotaSnapshot,
 };
+use aether_admin::system::ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY;
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
 use aether_data_contracts::repository::quota::{
@@ -297,7 +298,7 @@ async fn apply_remote_quota(
 ) -> Result<Value, String> {
     let kill_switch = state
         .app()
-        .read_system_config_json_value("enable_provider_remote_quota_sync")
+        .read_system_config_json_value(ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY)
         .await
         .map_err(|error| format!("读取远程额度同步开关失败: {}", error.into_message()))?;
     if !system_config_bool(kill_switch.as_ref(), true) {

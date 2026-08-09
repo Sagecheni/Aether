@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aether_admin::system::PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_DEFAULT_SECONDS;
 use chrono::Utc;
 use tracing::{debug, warn};
 
@@ -12,20 +13,20 @@ use super::{
     duration_until_next_db_maintenance_run, duration_until_next_stats_aggregation_run,
     duration_until_next_stats_hourly_aggregation_run, maintenance_timezone, parse_hhmm_time,
     perform_oauth_token_refresh_once, perform_provider_quota_alert_once,
-    perform_provider_remote_quota_sync_once, provider_checkin_schedule, run_audit_cleanup_once,
-    run_db_maintenance_once, run_gemini_file_mapping_cleanup_once, run_pending_cleanup_once,
-    run_pool_monitor_once, run_provider_checkin_once, run_proxy_node_metrics_cleanup_once,
+    perform_provider_remote_quota_sync_once, provider_checkin_schedule,
+    provider_remote_quota_sync_interval, run_audit_cleanup_once, run_db_maintenance_once,
+    run_gemini_file_mapping_cleanup_once, run_pending_cleanup_once, run_pool_monitor_once,
+    run_provider_checkin_once, run_proxy_node_metrics_cleanup_once,
     run_proxy_node_stale_cleanup_once, run_proxy_upgrade_rollout_once,
     run_request_candidate_cleanup_once, run_stats_aggregation_once,
     run_stats_hourly_aggregation_once, run_usage_cleanup_once, run_usage_counter_flush_once,
     run_wallet_daily_usage_aggregation_once, AUDIT_LOG_CLEANUP_INTERVAL,
     GEMINI_FILE_MAPPING_CLEANUP_INTERVAL, OAUTH_TOKEN_REFRESH_INTERVAL, PENDING_CLEANUP_INTERVAL,
     POOL_MONITOR_INTERVAL, PROVIDER_CHECKIN_DEFAULT_TIME, PROVIDER_QUOTA_ALERT_INTERVAL,
-    PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL, PROXY_NODE_METRICS_CLEANUP_HOUR,
-    PROXY_NODE_METRICS_CLEANUP_MINUTE, PROXY_NODE_STALE_SWEEP_INTERVAL,
-    PROXY_UPGRADE_ROLLOUT_INTERVAL, REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR,
-    USAGE_CLEANUP_MINUTE, WALLET_DAILY_USAGE_AGGREGATION_HOUR,
-    WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
+    PROXY_NODE_METRICS_CLEANUP_HOUR, PROXY_NODE_METRICS_CLEANUP_MINUTE,
+    PROXY_NODE_STALE_SWEEP_INTERVAL, PROXY_UPGRADE_ROLLOUT_INTERVAL,
+    REQUEST_CANDIDATE_CLEANUP_INTERVAL, USAGE_CLEANUP_HOUR, USAGE_CLEANUP_MINUTE,
+    WALLET_DAILY_USAGE_AGGREGATION_HOUR, WALLET_DAILY_USAGE_AGGREGATION_MINUTE,
 };
 use super::{UsageCounterFlushRuntimeMetrics, UsageCounterFlushWorkerConfig};
 
@@ -525,6 +526,16 @@ pub(crate) fn spawn_provider_quota_alert_worker(
     ))
 }
 
+async fn provider_remote_quota_sync_worker_interval(state: &AppState) -> Duration {
+    match provider_remote_quota_sync_interval(&state.data).await {
+        Ok(interval) => interval,
+        Err(err) => {
+            log_maintenance_worker_failure("provider_remote_quota_sync", "interval_config", &err);
+            Duration::from_secs(PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_DEFAULT_SECONDS)
+        }
+    }
+}
+
 pub(crate) fn spawn_provider_remote_quota_sync_worker(
     state: AppState,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -539,22 +550,23 @@ pub(crate) fn spawn_provider_remote_quota_sync_worker(
             if let Err(err) = perform_provider_remote_quota_sync_once(&state).await {
                 log_maintenance_worker_failure("provider_remote_quota_sync", "startup", &err);
             }
-            let mut interval = tokio::time::interval(PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
+            let mut next_run = tokio::time::Instant::now()
+                + provider_remote_quota_sync_worker_interval(&state).await;
             let mut deferred_since = None;
             loop {
-                interval.tick().await;
-                if should_defer_for_database_pressure(
+                tokio::time::sleep_until(next_run).await;
+                let run_started_at = tokio::time::Instant::now();
+                if !should_defer_for_database_pressure(
                     &state.data,
                     "provider_remote_quota_sync",
                     &mut deferred_since,
                 ) {
-                    continue;
+                    if let Err(err) = perform_provider_remote_quota_sync_once(&state).await {
+                        log_maintenance_worker_failure("provider_remote_quota_sync", "tick", &err);
+                    }
                 }
-                if let Err(err) = perform_provider_remote_quota_sync_once(&state).await {
-                    log_maintenance_worker_failure("provider_remote_quota_sync", "tick", &err);
-                }
+                next_run =
+                    run_started_at + provider_remote_quota_sync_worker_interval(&state).await;
             }
         },
     ))

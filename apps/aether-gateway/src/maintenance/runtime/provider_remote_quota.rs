@@ -1,8 +1,16 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
+use aether_admin::system::{
+    ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY, PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_CONFIG_KEY,
+    PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_DEFAULT_SECONDS,
+    PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_MAX_SECONDS,
+    PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_MIN_SECONDS,
+};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
 };
+use aether_data_contracts::DataLayerError;
 use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 use tracing::warn;
@@ -10,9 +18,10 @@ use tracing::warn;
 use crate::admin_api::{
     admin_provider_ops_local_action_response, store_admin_provider_ops_balance_cache, AdminAppState,
 };
+use crate::data::GatewayDataState;
 use crate::{AppState, GatewayError};
 
-use super::{system_config_bool, PROVIDER_REMOTE_QUOTA_SYNC_CONCURRENCY};
+use super::{system_config_bool, system_config_u64, PROVIDER_REMOTE_QUOTA_SYNC_CONCURRENCY};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProviderRemoteQuotaSyncRunSummary {
@@ -22,15 +31,35 @@ pub(crate) struct ProviderRemoteQuotaSyncRunSummary {
     pub(crate) failed: usize,
 }
 
+pub(crate) async fn provider_remote_quota_sync_interval(
+    data: &GatewayDataState,
+) -> Result<Duration, DataLayerError> {
+    let seconds = system_config_u64(
+        data,
+        PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_CONFIG_KEY,
+        PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_DEFAULT_SECONDS,
+    )
+    .await?
+    .clamp(
+        PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_MIN_SECONDS,
+        PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_MAX_SECONDS,
+    );
+    Ok(Duration::from_secs(seconds))
+}
+
 pub(crate) async fn perform_provider_remote_quota_sync_once(
     state: &AppState,
 ) -> Result<ProviderRemoteQuotaSyncRunSummary, GatewayError> {
     if !state.has_provider_catalog_data_reader() || !state.has_provider_quota_data_writer() {
         return Ok(empty_summary());
     }
-    if !system_config_bool(&state.data, "enable_provider_remote_quota_sync", true)
-        .await
-        .map_err(|error| GatewayError::Internal(error.to_string()))?
+    if !system_config_bool(
+        &state.data,
+        ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY,
+        true,
+    )
+    .await
+    .map_err(|error| GatewayError::Internal(error.to_string()))?
     {
         return Ok(empty_summary());
     }
