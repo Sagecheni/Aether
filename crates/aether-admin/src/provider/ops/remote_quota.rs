@@ -81,7 +81,7 @@ struct SummarySubscription {
     id: String,
     group_id: String,
     group_name: String,
-    status: Option<String>,
+    status: String,
     daily_limit_usd: f64,
     daily_used_usd: f64,
     weekly_limit_usd: f64,
@@ -93,9 +93,7 @@ struct SummarySubscription {
 
 impl SummarySubscription {
     fn is_active_at(&self, now_unix_secs: u64) -> bool {
-        self.status
-            .as_deref()
-            .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+        self.status.eq_ignore_ascii_case("active")
             && self
                 .expires_at_unix_secs
                 .is_none_or(|expires_at| expires_at > now_unix_secs)
@@ -284,19 +282,22 @@ pub fn parse_sub2api_remote_quota(
         )
     })?;
     let progresses = parse_progress_subscriptions(progress_json)?;
-    let progress = progresses
-        .into_iter()
-        .find(|progress| {
-            progress.subscription_id == subscription.id
-                && progress.group_id == subscription.group_id
-        })
-        .ok_or_else(|| {
-            format!(
-                "Sub2API Group {} 的{}额度 progress 数据缺失",
-                subscription.group_id,
-                window.as_str()
-            )
-        })?;
+    let mut matching_progress = progresses.into_iter().filter(|progress| {
+        progress.subscription_id == subscription.id && progress.group_id == subscription.group_id
+    });
+    let progress = matching_progress.next().ok_or_else(|| {
+        format!(
+            "Sub2API Group {} 的{}额度 progress 数据缺失",
+            subscription.group_id,
+            window.as_str()
+        )
+    })?;
+    if matching_progress.next().is_some() {
+        return Err(format!(
+            "Sub2API Group {} 存在多个匹配的 progress 记录，无法确定唯一额度窗口",
+            subscription.group_id
+        ));
+    }
     let progress_window = progress.window(window).ok_or_else(|| {
         format!(
             "Sub2API Group {} 的{}额度窗口尚未激活或 progress 数据缺失",
@@ -359,6 +360,13 @@ fn parse_summary_subscription(value: &Value) -> Result<SummarySubscription, Stri
         })
         .ok_or_else(|| format!("Sub2API 套餐 {id} 缺少 group_id"))?;
     let group = item.get("group").and_then(Value::as_object);
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("Sub2API 套餐 {id} 缺少 status"))?;
     let group_name = item
         .get("group_name")
         .and_then(Value::as_str)
@@ -381,10 +389,7 @@ fn parse_summary_subscription(value: &Value) -> Result<SummarySubscription, Stri
         id,
         group_id,
         group_name,
-        status: item
-            .get("status")
-            .and_then(Value::as_str)
-            .map(|value| value.trim().to_string()),
+        status,
         daily_limit_usd,
         daily_used_usd,
         weekly_limit_usd,
@@ -981,6 +986,34 @@ mod tests {
         )
         .expect_err("missing id must fail");
         assert!(error.contains("缺少 id"));
+    }
+
+    #[test]
+    fn rejects_authority_item_without_status_instead_of_classifying_exhausted() {
+        let error = parse_sub2api_remote_quota(
+            &json!({
+                "code": 0,
+                "data": {"subscriptions": [{"id": 9, "group_id": 42}]}
+            }),
+            None,
+            "42",
+        )
+        .expect_err("missing status must fail the authoritative snapshot");
+        assert!(error.contains("缺少 status"));
+    }
+
+    #[test]
+    fn rejects_duplicate_matching_progress_records() {
+        let mut duplicate_progress = progress();
+        let duplicate = duplicate_progress["data"][0].clone();
+        duplicate_progress["data"]
+            .as_array_mut()
+            .expect("progress data should be an array")
+            .push(duplicate);
+
+        let error = parse_sub2api_remote_quota(&summary(), Some(&duplicate_progress), "42")
+            .expect_err("duplicate matching progress must not be selected by response order");
+        assert!(error.contains("多个匹配的 progress"));
     }
 
     #[test]
