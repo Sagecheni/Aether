@@ -140,6 +140,19 @@ WHERE billing_type = 'monthly_quota'
             .map_err(|_| {
                 DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
             })?;
+        let observed_window_start = patch
+            .local_usage_observation
+            .as_ref()
+            .and_then(|observation| observation.quota_last_reset_at_unix_secs)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                DataLayerError::InvalidInput("observed local quota window is too large".to_string())
+            })?;
+        let observed_used_usd = patch
+            .local_usage_observation
+            .as_ref()
+            .map_or(0.0, |observation| observation.monthly_used_usd);
         let now = chrono::Utc::now().timestamp().max(0);
         let rows_affected = sqlx::query(
             r#"
@@ -147,10 +160,14 @@ UPDATE providers
 SET billing_type = ?,
     monthly_quota_usd = ?,
     monthly_used_usd = CASE
-        WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
-            THEN MAX(COALESCE(monthly_used_usd, 0), ?)
         WHEN ? THEN COALESCE(monthly_used_usd, 0)
-        ELSE ?
+        ELSE ? + CASE
+            WHEN quota_last_reset_at IS ?
+                THEN MAX(COALESCE(monthly_used_usd, 0) - ?, 0)
+            WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
+                THEN MAX(COALESCE(monthly_used_usd, 0), 0)
+            ELSE 0
+        END
     END,
     quota_reset_day = ?,
     quota_last_reset_at = ?,
@@ -162,11 +179,12 @@ WHERE id = ?
         )
         .bind(&patch.billing_type)
         .bind(patch.monthly_quota_usd)
-        .bind(window_start)
-        .bind(window_end)
-        .bind(patch.remote_monthly_used_usd)
         .bind(patch.preserve_local_used_usd)
         .bind(patch.remote_monthly_used_usd)
+        .bind(observed_window_start)
+        .bind(observed_used_usd)
+        .bind(window_start)
+        .bind(window_end)
         .bind(patch.quota_reset_day.map(|days| days as i64))
         .bind(window_start)
         .bind(expires_at)
@@ -208,7 +226,7 @@ mod tests {
     use super::SqliteProviderQuotaRepository;
     use aether_data_contracts::repository::quota::{
         ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
-        ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
+        ProviderQuotaReadRepository, ProviderQuotaUsageObservation, ProviderQuotaWriteRepository,
     };
 
     use crate::run_migrations;
@@ -274,6 +292,10 @@ mod tests {
             remote_window_end_unix_secs: 800_000,
             quota_reset_day: Some(30),
             quota_expires_at_unix_secs: Some(900_000),
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 0.0,
+                quota_last_reset_at_unix_secs: Some(605_800),
+            }),
             preserve_local_used_usd: false,
         };
         repository
@@ -283,17 +305,32 @@ mod tests {
         repository
             .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
                 remote_monthly_used_usd: 2.0,
+                local_usage_observation: Some(ProviderQuotaUsageObservation {
+                    monthly_used_usd: 2.0,
+                    quota_last_reset_at_unix_secs: Some(700_000),
+                }),
                 ..initial_remote.clone()
             })
             .await
-            .expect("same remote window should apply");
+            .expect("fetch-time local increment should survive reconciliation");
+        repository
+            .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                remote_monthly_used_usd: 2.0,
+                local_usage_observation: Some(ProviderQuotaUsageObservation {
+                    monthly_used_usd: 3.0,
+                    quota_last_reset_at_unix_secs: Some(700_000),
+                }),
+                ..initial_remote.clone()
+            })
+            .await
+            .expect("next authoritative snapshot should remove the old local estimate");
         let quota = repository
             .find_by_provider_id("provider-1")
             .await
             .expect("quota should reload")
             .expect("quota should exist");
         assert_eq!(quota.monthly_quota_usd, Some(100.0));
-        assert_eq!(quota.monthly_used_usd, 3.0);
+        assert_eq!(quota.monthly_used_usd, 2.0);
         assert_eq!(quota.quota_reset_day, Some(30));
 
         repository
@@ -301,6 +338,10 @@ mod tests {
                 remote_monthly_used_usd: 1.0,
                 remote_window_start_unix_secs: 800_000,
                 remote_window_end_unix_secs: 900_000,
+                local_usage_observation: Some(ProviderQuotaUsageObservation {
+                    monthly_used_usd: 2.0,
+                    quota_last_reset_at_unix_secs: Some(700_000),
+                }),
                 ..initial_remote.clone()
             })
             .await
@@ -317,6 +358,7 @@ mod tests {
             remote_monthly_used_usd: 0.0,
             remote_window_start_unix_secs: 900_000,
             remote_window_end_unix_secs: 1_000_000,
+            local_usage_observation: None,
             preserve_local_used_usd: true,
             ..initial_remote.clone()
         };

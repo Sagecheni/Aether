@@ -73,6 +73,16 @@ export function parseProviderRemoteQuotaGroup(
   const weeklyUsed = finiteNonNegativeNumber(subscription.weekly_used_usd)
   const monthlyLimit = finiteNonNegativeNumber(subscription.monthly_limit_usd)
   const monthlyUsed = finiteNonNegativeNumber(subscription.monthly_used_usd)
+  const local = asRecord(sync.local)
+  const remote = asRecord(sync.remote)
+  const localBillingType = local?.billing_type === 'monthly_quota'
+    || local?.billing_type === 'pay_as_you_go'
+    ? local.billing_type
+    : null
+  const localMonthlyQuota = nullableFiniteNumber(local?.monthly_quota_usd)
+  const localMonthlyUsed = finiteNonNegativeNumber(local?.monthly_used_usd)
+  const remoteConfirmedUsed = finiteNonNegativeNumber(local?.remote_confirmed_used_usd)
+    ?? finiteNonNegativeNumber(remote?.remote_used_usd)
   if (
     !groupId
     || !subscriptionId
@@ -98,7 +108,12 @@ export function parseProviderRemoteQuotaGroup(
     local_sync_window: localSyncWindow,
     expires_at_unix_secs: expiresAt,
     sync_status: syncStatus,
-    sync_message: stringValue(sync?.message),
+    sync_message: stringValue(sync.message),
+    sync_executed_at: stringValue(result.executed_at),
+    local_billing_type: localBillingType,
+    local_monthly_quota_usd: localMonthlyQuota,
+    local_monthly_used_usd: localMonthlyUsed,
+    remote_confirmed_used_usd: remoteConfirmedUsed,
   }
 }
 

@@ -123,7 +123,9 @@
         variant="outline"
         class="text-xs font-normal border-border/50"
       >
-        {{ quotaMonitor?.source === 'remote_subscription' ? legacyT('订阅额度') : formatBillingType(provider.billing_type || 'pay_as_you_go') }}
+        {{ quotaMonitor?.source === 'remote_subscription'
+          ? (quotaMonitor.state === 'pending' ? legacyT('订阅额度') : t('providers.quota.localEffective'))
+          : formatBillingType(provider.billing_type || 'pay_as_you_go') }}
       </Badge>
       <span
         v-if="quotaMonitor"
@@ -290,7 +292,7 @@ const quotaMonitor = computed(() => providerQuotaMonitor(
   props.provider,
   props.remoteQuotaGroup ?? null,
 ))
-const { legacyT, locale } = useI18n()
+const { legacyT, locale, t } = useI18n()
 
 watch(
   () => props.editingDescriptionId,

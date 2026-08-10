@@ -6,6 +6,7 @@ function resultWithSubscription(
   subscription: Record<string, unknown>,
   status: RemoteQuotaSyncStatus = 'applied',
   message?: string,
+  syncExtra: Record<string, unknown> = {},
 ): ActionResultResponse {
   return {
     status: 'success',
@@ -18,6 +19,7 @@ function resultWithSubscription(
           status,
           message,
           subscription,
+          ...syncExtra,
         },
       },
     },
@@ -42,6 +44,13 @@ describe('provider balance remote quota snapshot', () => {
       monthly_used_usd: 0,
       local_sync_window: 'daily',
       expires_at_unix_secs: 1_896_134_400,
+    }, 'applied', undefined, {
+      local: {
+        billing_type: 'monthly_quota',
+        monthly_quota_usd: 10,
+        monthly_used_usd: 2.5,
+        remote_confirmed_used_usd: 2.25,
+      },
     }))
 
     expect(parsed).toMatchObject({
@@ -54,6 +63,11 @@ describe('provider balance remote quota snapshot', () => {
       local_sync_window: 'daily',
       sync_status: 'applied',
       sync_message: null,
+      sync_executed_at: '2030-01-30T00:00:00Z',
+      local_billing_type: 'monthly_quota',
+      local_monthly_quota_usd: 10,
+      local_monthly_used_usd: 2.5,
+      remote_confirmed_used_usd: 2.25,
     })
   })
 

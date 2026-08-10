@@ -45,6 +45,71 @@ describe('providerQuotaMonitor', () => {
     })
   })
 
+  it('prefers the applied local snapshot over a stale provider-list row', () => {
+    expect(providerQuotaMonitor(provider({
+      ops_remote_quota_enabled: true,
+      billing_type: 'monthly_quota',
+      monthly_quota_usd: 100,
+      monthly_used_usd: 25,
+    }), {
+      group_id: '3',
+      group_name: 'Daily',
+      subscription_id: '9',
+      daily_limit_usd: 10,
+      daily_used_usd: 2,
+      weekly_limit_usd: 50,
+      weekly_used_usd: 8,
+      monthly_limit_usd: 100,
+      monthly_used_usd: 25,
+      local_sync_window: 'daily',
+      expires_at_unix_secs: null,
+      sync_status: 'applied',
+      sync_executed_at: '2026-01-02T00:00:00Z',
+      local_billing_type: 'monthly_quota',
+      local_monthly_quota_usd: 10,
+      local_monthly_used_usd: 2.5,
+    })).toEqual({
+      source: 'remote_subscription',
+      state: 'limited',
+      limitUsd: 10,
+      usedUsd: 2.5,
+      remainingUsd: 7.5,
+    })
+  })
+
+  it('keeps a provider row that is newer than the cached applied snapshot', () => {
+    expect(providerQuotaMonitor(provider({
+      ops_remote_quota_enabled: true,
+      billing_type: 'monthly_quota',
+      monthly_quota_usd: 10,
+      monthly_used_usd: 4,
+      updated_at: '2026-01-03T00:00:00Z',
+    }), {
+      group_id: '3',
+      group_name: 'Daily',
+      subscription_id: '9',
+      daily_limit_usd: 10,
+      daily_used_usd: 2,
+      weekly_limit_usd: 50,
+      weekly_used_usd: 8,
+      monthly_limit_usd: 100,
+      monthly_used_usd: 25,
+      local_sync_window: 'daily',
+      expires_at_unix_secs: null,
+      sync_status: 'applied',
+      sync_executed_at: '2026-01-02T00:00:00Z',
+      local_billing_type: 'monthly_quota',
+      local_monthly_quota_usd: 10,
+      local_monthly_used_usd: 2.5,
+    })).toEqual({
+      source: 'remote_subscription',
+      state: 'limited',
+      limitUsd: 10,
+      usedUsd: 4,
+      remainingUsd: 6,
+    })
+  })
+
   it('does not mistake an unsynced subscription for wallet balance', () => {
     expect(providerQuotaMonitor(provider({
       ops_remote_quota_enabled: true,

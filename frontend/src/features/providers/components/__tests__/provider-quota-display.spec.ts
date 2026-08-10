@@ -40,7 +40,7 @@ describe('provider quota display components', () => {
     unmount()
   })
 
-  it('shows every Sub2API subscription window and marks the locally synced one', () => {
+  it('shows every Sub2API subscription window and marks the locally mapped one', () => {
     setI18nLocale('zh-CN')
     const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
       resetIntervalDays: 1,
@@ -61,7 +61,7 @@ describe('provider quota display components', () => {
 
     expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('日限额')
     expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('$2 / $10')
-    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('当前生效')
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).toContain('映射到本地')
     expect(root.querySelector('[data-testid="provider-remote-quota-weekly"]')?.textContent).toContain('$8 / $50')
     expect(root.querySelector('[data-testid="provider-remote-quota-monthly"]')?.textContent).toContain('不限')
     expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')?.textContent?.replace(/\s+/g, ' ').trim()).toBe('日限额 · 每日重置')
@@ -70,9 +70,46 @@ describe('provider quota display components', () => {
     unmount()
   })
 
+  it('separates locally enforced, upstream-confirmed, and in-sync local usage', () => {
+    setI18nLocale('zh-CN')
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      used: 2.5,
+      quota: 10,
+      billingType: 'monthly_quota',
+      resetIntervalDays: 1,
+      remoteQuotaEnabled: true,
+      remoteQuotaGroup: {
+        group_id: '42',
+        group_name: 'Pro',
+        subscription_id: '9',
+        daily_limit_usd: 10,
+        daily_used_usd: 2,
+        weekly_limit_usd: 50,
+        weekly_used_usd: 8,
+        monthly_limit_usd: 0,
+        monthly_used_usd: 0,
+        local_sync_window: 'daily',
+        expires_at_unix_secs: null,
+        sync_status: 'applied',
+        remote_confirmed_used_usd: 2.25,
+      },
+    })
+
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-effective"]')?.textContent).toContain('本地生效额度')
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-effective"]')?.textContent).toContain('$2.50 / $10.00')
+    expect(root.querySelector('[data-testid="provider-remote-quota-confirmed-used"]')?.textContent).toContain('上游已确认: $2.25')
+    expect(root.querySelector('[data-testid="provider-remote-quota-pending-local"]')?.textContent).toContain('同步期间本地增量: $0.25')
+    expect(root.textContent).toContain('Sub2API 上游套餐窗口')
+
+    unmount()
+  })
+
   it('does not label a remote window active when the latest apply failed', () => {
     setI18nLocale('zh-CN')
     const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      used: 4,
+      quota: 10,
+      billingType: 'monthly_quota',
       remoteQuotaEnabled: true,
       resetIntervalDays: 1,
       remoteQuotaGroup: {
@@ -92,7 +129,8 @@ describe('provider quota display components', () => {
       },
     })
 
-    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).not.toContain('当前生效')
+    expect(root.querySelector('[data-testid="provider-remote-quota-daily"]')?.textContent).not.toContain('映射到本地')
+    expect(root.querySelector('[data-testid="provider-remote-quota-local-effective"]')?.textContent).toContain('$4.00 / $10.00')
     expect(root.querySelector('[data-testid="provider-remote-quota-sync-warning"]')?.textContent).toContain('progress 数据缺失')
     expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')).toBeNull()
 
@@ -137,7 +175,7 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-remote-quota-weekly"]')?.textContent).toContain('不限')
     expect(root.querySelector('[data-testid="provider-remote-quota-monthly"]')?.textContent).toContain('不限')
     expect(root.querySelector('[data-testid="provider-remote-quota-local-window"]')?.textContent).toContain('日、周、月均不限')
-    expect(root.textContent).not.toContain('当前生效')
+    expect(root.textContent).not.toContain('映射到本地')
 
     unmount()
   })

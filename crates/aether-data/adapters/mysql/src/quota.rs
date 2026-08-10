@@ -152,6 +152,19 @@ WHERE billing_type = 'monthly_quota'
             .map_err(|_| {
                 DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
             })?;
+        let observed_window_start = patch
+            .local_usage_observation
+            .as_ref()
+            .and_then(|observation| observation.quota_last_reset_at_unix_secs)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                DataLayerError::InvalidInput("observed local quota window is too large".to_string())
+            })?;
+        let observed_used_usd = patch
+            .local_usage_observation
+            .as_ref()
+            .map_or(0.0, |observation| observation.monthly_used_usd);
         let now = chrono::Utc::now().timestamp().max(0);
         let rows_affected = sqlx::query(
             r#"
@@ -159,10 +172,14 @@ UPDATE providers
 SET billing_type = ?,
     monthly_quota_usd = ?,
     monthly_used_usd = CASE
-        WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
-            THEN GREATEST(COALESCE(monthly_used_usd, 0), ?)
         WHEN ? THEN COALESCE(monthly_used_usd, 0)
-        ELSE ?
+        ELSE ? + CASE
+            WHEN quota_last_reset_at <=> ?
+                THEN GREATEST(COALESCE(monthly_used_usd, 0) - ?, 0)
+            WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
+                THEN GREATEST(COALESCE(monthly_used_usd, 0), 0)
+            ELSE 0
+        END
     END,
     quota_reset_day = ?,
     quota_last_reset_at = ?,
@@ -174,11 +191,12 @@ WHERE id = ?
         )
         .bind(&patch.billing_type)
         .bind(patch.monthly_quota_usd)
-        .bind(window_start)
-        .bind(window_end)
-        .bind(patch.remote_monthly_used_usd)
         .bind(patch.preserve_local_used_usd)
         .bind(patch.remote_monthly_used_usd)
+        .bind(observed_window_start)
+        .bind(observed_used_usd)
+        .bind(window_start)
+        .bind(window_end)
         .bind(patch.quota_reset_day.map(|days| days as i64))
         .bind(window_start)
         .bind(expires_at)

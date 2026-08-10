@@ -97,21 +97,10 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         {
             return Ok(ApplyRemoteProviderQuotaOutcome::StaleWindow(quota.clone()));
         }
-        let same_window = quota
-            .quota_last_reset_at_unix_secs
-            .is_some_and(|window_start| {
-                window_start >= patch.remote_window_start_unix_secs
-                    && window_start < patch.remote_window_end_unix_secs
-            });
+        let reconciled_monthly_used_usd = patch.reconciled_monthly_used_usd(quota);
         quota.billing_type = patch.billing_type.clone();
         quota.monthly_quota_usd = patch.monthly_quota_usd;
-        quota.monthly_used_usd = if same_window {
-            quota.monthly_used_usd.max(patch.remote_monthly_used_usd)
-        } else if patch.preserve_local_used_usd {
-            quota.monthly_used_usd
-        } else {
-            patch.remote_monthly_used_usd
-        };
+        quota.monthly_used_usd = reconciled_monthly_used_usd;
         quota.quota_reset_day = patch.quota_reset_day;
         quota.quota_last_reset_at_unix_secs = Some(patch.remote_window_start_unix_secs);
         quota.quota_expires_at_unix_secs = patch.quota_expires_at_unix_secs;
@@ -124,7 +113,8 @@ mod tests {
     use super::InMemoryProviderQuotaRepository;
     use crate::repository::quota::{
         ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
-        ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
+        ProviderQuotaReadRepository, ProviderQuotaUsageObservation, ProviderQuotaWriteRepository,
+        StoredProviderQuotaSnapshot,
     };
 
     fn sample_quota() -> StoredProviderQuotaSnapshot {
@@ -169,6 +159,10 @@ mod tests {
             remote_window_end_unix_secs: 8_000,
             quota_reset_day: Some(30),
             quota_expires_at_unix_secs: Some(9_000),
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 5.0,
+                quota_last_reset_at_unix_secs: Some(1_000),
+            }),
             preserve_local_used_usd: false,
         };
         assert!(matches!(
@@ -181,6 +175,10 @@ mod tests {
 
         let same_window_lower = ApplyRemoteProviderQuotaPatch {
             remote_monthly_used_usd: 3.0,
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 4.0,
+                quota_last_reset_at_unix_secs: Some(2_000),
+            }),
             ..first.clone()
         };
         repository
@@ -192,13 +190,17 @@ mod tests {
             .await
             .expect("quota should load")
             .expect("quota should exist");
-        assert_eq!(stored.monthly_used_usd, 4.0);
+        assert_eq!(stored.monthly_used_usd, 3.0);
         assert_eq!(stored.quota_reset_day, Some(30));
 
         let next_window = ApplyRemoteProviderQuotaPatch {
             remote_monthly_used_usd: 1.0,
             remote_window_start_unix_secs: 8_000,
             remote_window_end_unix_secs: 14_000,
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 3.0,
+                quota_last_reset_at_unix_secs: Some(2_000),
+            }),
             ..first.clone()
         };
         repository
@@ -217,6 +219,7 @@ mod tests {
             remote_monthly_used_usd: 0.0,
             remote_window_start_unix_secs: 14_000,
             remote_window_end_unix_secs: 20_000,
+            local_usage_observation: None,
             preserve_local_used_usd: true,
             ..first.clone()
         };

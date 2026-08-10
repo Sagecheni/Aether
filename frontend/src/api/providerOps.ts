@@ -162,6 +162,11 @@ export interface Sub2ApiRemoteQuotaGroup {
   /** Present on cached balance snapshots; discovery results do not carry apply state. */
   sync_status?: RemoteQuotaSyncStatus
   sync_message?: string | null
+  sync_executed_at?: string | null
+  local_billing_type?: 'monthly_quota' | 'pay_as_you_go' | null
+  local_monthly_quota_usd?: number | null
+  local_monthly_used_usd?: number | null
+  remote_confirmed_used_usd?: number | null
 }
 
 export interface SaveConfigRequest {

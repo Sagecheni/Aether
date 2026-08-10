@@ -17,12 +17,93 @@ use aether_admin::system::ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY;
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
 use aether_data_contracts::repository::quota::{
-    ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
+    ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch, ProviderQuotaUsageObservation,
 };
 use serde_json::{json, Value};
+use std::time::Duration;
 use tracing::warn;
+use uuid::Uuid;
+
+const REMOTE_QUOTA_SYNC_LOCK_TTL: Duration = Duration::from_secs(120);
 
 pub(super) async fn admin_provider_ops_sub2api_balance_payload(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    provider: &StoredProviderCatalogProvider,
+    base_url: &str,
+    action_config: &serde_json::Map<String, serde_json::Value>,
+    credentials: &serde_json::Map<String, serde_json::Value>,
+    proxy_snapshot: Option<&ProxySnapshot>,
+    remote_quota_config: Option<&Sub2ApiRemoteQuotaConfig>,
+) -> serde_json::Value {
+    if remote_quota_config.is_none() {
+        return admin_provider_ops_sub2api_balance_payload_inner(
+            state,
+            provider_id,
+            provider,
+            base_url,
+            action_config,
+            credentials,
+            proxy_snapshot,
+            remote_quota_config,
+        )
+        .await;
+    }
+
+    let lock_key = format!("provider_ops:remote_quota_sync:{provider_id}");
+    let lock_owner = format!("aether-gateway-remote-quota-{}", Uuid::new_v4());
+    let lock = match state
+        .runtime_state()
+        .lock_try_acquire(&lock_key, &lock_owner, REMOTE_QUOTA_SYNC_LOCK_TTL)
+        .await
+    {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return admin_provider_ops_action_error(
+                "unknown_error",
+                "query_balance",
+                "该 Provider 的远程额度同步正在进行，请稍后重试".to_string(),
+                None,
+            );
+        }
+        Err(error) => {
+            warn!(
+                provider_id = %provider_id,
+                error = ?error,
+                "failed to acquire remote quota sync lock"
+            );
+            return admin_provider_ops_action_error(
+                "unknown_error",
+                "query_balance",
+                "远程额度同步锁不可用，本地额度保持不变".to_string(),
+                None,
+            );
+        }
+    };
+
+    let payload = admin_provider_ops_sub2api_balance_payload_inner(
+        state,
+        provider_id,
+        provider,
+        base_url,
+        action_config,
+        credentials,
+        proxy_snapshot,
+        remote_quota_config,
+    )
+    .await;
+
+    if let Err(error) = state.runtime_state().lock_release(&lock).await {
+        warn!(
+            provider_id = %provider_id,
+            error = ?error,
+            "failed to release remote quota sync lock"
+        );
+    }
+    payload
+}
+
+async fn admin_provider_ops_sub2api_balance_payload_inner(
     state: &AdminAppState<'_>,
     provider_id: &str,
     provider: &StoredProviderCatalogProvider,
@@ -102,6 +183,23 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
     let progress_url = remote_quota_config.map(|config| {
         admin_provider_ops_sub2api_request_url(base_url, config.progress_endpoint.as_str())
     });
+    // Observe local usage immediately before the authoritative remote fetch.
+    // The repository later replaces older local estimates with the remote
+    // absolute value while retaining only usage added during this fetch.
+    let local_usage_observation = if remote_quota_config.is_some() {
+        Some(
+            match state.app().read_provider_quota_snapshot(provider_id).await {
+                Ok(Some(snapshot)) => Ok(ProviderQuotaUsageObservation::from(&snapshot)),
+                Ok(None) => Err("读取本地 Provider 配额失败: Provider 不存在".to_string()),
+                Err(error) => Err(format!(
+                    "读取本地 Provider 配额失败: {}",
+                    error.into_message()
+                )),
+            },
+        )
+    } else {
+        None
+    };
 
     let auth_value = match reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}"))
     {
@@ -261,7 +359,16 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
                 progress_json.as_ref(),
                 remote_quota_config.group_id.as_str(),
             ) {
-                Ok(snapshot) => match apply_remote_quota(state, provider_id, snapshot).await {
+                Ok(snapshot) => match apply_remote_quota(
+                    state,
+                    provider_id,
+                    snapshot,
+                    local_usage_observation
+                        .as_ref()
+                        .expect("remote quota fetch has a local usage observation result"),
+                )
+                .await
+                {
                     Ok(mut status) => {
                         if let Some(warning) = progress_warning {
                             status["warning"] = Value::String(warning);
@@ -295,6 +402,7 @@ async fn apply_remote_quota(
     state: &AdminAppState<'_>,
     provider_id: &str,
     snapshot: Sub2ApiRemoteQuotaSnapshot,
+    local_usage_observation: &Result<ProviderQuotaUsageObservation, String>,
 ) -> Result<Value, String> {
     let kill_switch = state
         .app()
@@ -329,6 +437,7 @@ async fn apply_remote_quota(
                 remote_window_end_unix_secs: resets_at_unix_secs,
                 quota_reset_day: Some(window.interval_days()),
                 quota_expires_at_unix_secs: expires_at_unix_secs,
+                local_usage_observation: Some(local_usage_observation.clone()?),
                 preserve_local_used_usd: false,
             },
             json!({
@@ -361,6 +470,7 @@ async fn apply_remote_quota(
                     remote_window_end_unix_secs: observed_at.saturating_add(1),
                     quota_reset_day: None,
                     quota_expires_at_unix_secs: expires_at_unix_secs,
+                    local_usage_observation: None,
                     preserve_local_used_usd: true,
                 },
                 json!({
@@ -384,6 +494,7 @@ async fn apply_remote_quota(
                     remote_window_end_unix_secs: observed_at.saturating_add(1),
                     quota_reset_day: None,
                     quota_expires_at_unix_secs: None,
+                    local_usage_observation: None,
                     preserve_local_used_usd: true,
                 },
                 json!({
@@ -399,17 +510,27 @@ async fn apply_remote_quota(
         .await
         .map_err(|error| format!("写入本地 Provider 配额失败: {}", error.into_message()))?;
     match outcome {
-        ApplyRemoteProviderQuotaOutcome::Applied(local) => Ok(json!({
-            "status": "applied",
-            "remote": detail,
-            "local": {
+        ApplyRemoteProviderQuotaOutcome::Applied(local) => {
+            let mut local_detail = json!({
                 "billing_type": local.billing_type,
                 "monthly_quota_usd": local.monthly_quota_usd,
                 "monthly_used_usd": local.monthly_used_usd,
                 "quota_last_reset_at_unix_secs": local.quota_last_reset_at_unix_secs,
                 "quota_expires_at_unix_secs": local.quota_expires_at_unix_secs,
+            });
+            if let Some(remote_confirmed_used_usd) =
+                detail.get("remote_used_usd").and_then(Value::as_f64)
+            {
+                local_detail["remote_confirmed_used_usd"] = json!(remote_confirmed_used_usd);
+                local_detail["pending_local_used_usd"] =
+                    json!((local.monthly_used_usd - remote_confirmed_used_usd).max(0.0));
             }
-        })),
+            Ok(json!({
+                "status": "applied",
+                "remote": detail,
+                "local": local_detail,
+            }))
+        }
         ApplyRemoteProviderQuotaOutcome::StaleWindow(local) => Ok(json!({
             "status": "stale_window",
             "message": "远程套餐窗口早于本地已同步窗口，本地额度保持不变",

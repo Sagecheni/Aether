@@ -25,6 +25,18 @@ function remoteGroupIsUnlimited(group: Sub2ApiRemoteQuotaGroup | null): boolean 
     && group.monthly_limit_usd <= 0
 }
 
+function appliedLocalSnapshotIsCurrent(
+  provider: ProviderWithEndpointsSummary,
+  group: Sub2ApiRemoteQuotaGroup | null,
+): boolean {
+  if (group?.sync_status !== 'applied') return false
+  const syncTime = Date.parse(group.sync_executed_at ?? '')
+  const providerTime = Date.parse(provider.updated_at)
+  return !Number.isFinite(syncTime)
+    || !Number.isFinite(providerTime)
+    || syncTime >= providerTime
+}
+
 export function providerQuotaMonitor(
   provider: ProviderWithEndpointsSummary,
   remoteGroup: Sub2ApiRemoteQuotaGroup | null = null,
@@ -32,9 +44,17 @@ export function providerQuotaMonitor(
   const remoteSubscription = provider.ops_remote_quota_enabled === true
   if (!remoteSubscription) return null
 
-  if (provider.billing_type === 'monthly_quota') {
-    const limitUsd = finiteNonNegative(provider.monthly_quota_usd)
-    const usedUsd = finiteNonNegative(provider.monthly_used_usd)
+  const appliedLocal = appliedLocalSnapshotIsCurrent(provider, remoteGroup)
+    ? remoteGroup
+    : null
+  const billingType = appliedLocal?.local_billing_type ?? provider.billing_type
+  if (billingType === 'monthly_quota') {
+    const limitUsd = finiteNonNegative(
+      appliedLocal?.local_monthly_quota_usd ?? provider.monthly_quota_usd,
+    )
+    const usedUsd = finiteNonNegative(
+      appliedLocal?.local_monthly_used_usd ?? provider.monthly_used_usd,
+    )
     if (limitUsd !== null && usedUsd !== null) {
       if (limitUsd === 0 || usedUsd >= limitUsd) {
         return { source: 'remote_subscription', state: 'exhausted' }

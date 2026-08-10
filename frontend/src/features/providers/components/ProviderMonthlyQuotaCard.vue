@@ -28,6 +28,61 @@
       </div>
 
       <template v-if="remoteQuotaGroup">
+        <div
+          v-if="hasLocalEffectiveQuota"
+          class="rounded-lg border border-indigo-500/20 bg-indigo-500/5 p-3"
+          data-testid="provider-remote-quota-local-effective"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="text-xs font-medium text-muted-foreground">
+              {{ t('providers.quota.localEffective') }}
+            </span>
+            <Badge
+              variant="secondary"
+              class="px-1.5 py-0 text-[10px]"
+            >
+              {{ usedPercent.toFixed(1) }}%
+            </Badge>
+          </div>
+          <div class="relative mt-2 h-1.5 w-full overflow-hidden rounded-full bg-border">
+            <div
+              class="absolute inset-y-0 left-0 transition-all duration-300"
+              :class="barClass"
+              :style="{ width: `${cappedUsedPercent}%` }"
+            />
+          </div>
+          <div class="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs">
+            <span class="font-semibold tabular-nums">
+              ${{ used.toFixed(2) }} / ${{ quota.toFixed(2) }}
+            </span>
+            <span
+              v-if="resetIntervalText"
+              class="text-muted-foreground"
+            >
+              {{ resetIntervalText }}
+            </span>
+          </div>
+          <div
+            v-if="remoteConfirmedUsedUsd !== null"
+            class="mt-2 flex flex-wrap gap-x-4 gap-y-1 border-t border-border/60 pt-2 text-[11px] text-muted-foreground"
+          >
+            <span data-testid="provider-remote-quota-confirmed-used">
+              {{ t('providers.quota.remoteConfirmed') }}:
+              <span class="font-medium tabular-nums text-foreground/80">{{ formatMoney(remoteConfirmedUsedUsd) }}</span>
+            </span>
+            <span
+              v-if="pendingLocalUsedUsd >= 0.005"
+              data-testid="provider-remote-quota-pending-local"
+            >
+              {{ t('providers.quota.syncLocalDelta') }}:
+              <span class="font-medium tabular-nums text-foreground/80">{{ formatMoney(pendingLocalUsedUsd) }}</span>
+            </span>
+          </div>
+        </div>
+
+        <p class="text-xs font-medium text-muted-foreground">
+          {{ t('providers.quota.upstreamWindows') }}
+        </p>
         <div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
           <div
             v-for="window in sub2ApiQuotaWindows"
@@ -44,7 +99,7 @@
                 variant="secondary"
                 class="px-1.5 py-0 text-[10px]"
               >
-                {{ t('providers.quota.localSynced') }}
+                {{ t('providers.quota.mappedLocally') }}
               </Badge>
             </div>
             <p class="mt-2 text-sm font-semibold tabular-nums">
@@ -191,6 +246,19 @@ const barClass = computed(() => ratioBarClass(quota.value > 0 ? used.value / quo
 const remoteQuotaApplied = computed(() => {
   const status = props.remoteQuotaGroup?.sync_status
   return status === undefined || status === 'applied'
+})
+const hasLocalEffectiveQuota = computed(() => (
+  props.billingType === 'monthly_quota' && quota.value > 0
+))
+const remoteConfirmedUsedUsd = computed<number | null>(() => {
+  const group = props.remoteQuotaGroup
+  const window = group?.local_sync_window
+  if (!remoteQuotaApplied.value || !window || !group) return null
+  return group.remote_confirmed_used_usd ?? remoteWindowValues(window).used
+})
+const pendingLocalUsedUsd = computed(() => {
+  if (remoteConfirmedUsedUsd.value === null) return 0
+  return Math.max(used.value - remoteConfirmedUsedUsd.value, 0)
 })
 const remoteQuotaFallbackState = computed<'limited' | 'exhausted' | 'pending'>(() => {
   if (props.billingType !== 'monthly_quota') return 'pending'

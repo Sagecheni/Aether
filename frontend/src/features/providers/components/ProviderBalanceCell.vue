@@ -8,7 +8,7 @@
       variant="outline"
       class="text-[10px] font-normal border-indigo-500/30 text-indigo-600 dark:text-indigo-400"
     >
-      {{ legacyT('订阅额度') }}
+      {{ quotaMonitor.state === 'pending' ? legacyT('订阅额度') : t('providers.quota.localEffective') }}
     </Badge>
     <template v-if="quotaMonitor.state === 'limited'">
       <div class="font-semibold text-foreground/90 tabular-nums pt-0.5">
@@ -195,5 +195,5 @@ const quotaMonitor = computed(() => providerQuotaMonitor(
   props.remoteQuotaGroup ?? null,
 ))
 
-const { legacyT } = useI18n()
+const { legacyT, t } = useI18n()
 </script>

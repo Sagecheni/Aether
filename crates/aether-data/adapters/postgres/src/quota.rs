@@ -139,23 +139,45 @@ impl ProviderQuotaWriteRepository for SqlxProviderQuotaRepository {
             .map_err(|_| {
                 DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
             })?;
+        let observed_window_start = patch
+            .local_usage_observation
+            .as_ref()
+            .and_then(|observation| observation.quota_last_reset_at_unix_secs)
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                DataLayerError::InvalidInput("observed local quota window is too large".to_string())
+            })?;
+        let observed_used_usd = patch
+            .local_usage_observation
+            .as_ref()
+            .map_or(0.0, |observation| observation.monthly_used_usd);
         let result = sqlx::query(
             r#"
 UPDATE providers
 SET billing_type = CAST($2 AS providerbillingtype),
     monthly_quota_usd = $3,
     monthly_used_usd = CASE
-        WHEN CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) >= $4
-             AND CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) < $5
-            THEN GREATEST(COALESCE(monthly_used_usd, 0), $6)
         WHEN $7::boolean THEN COALESCE(monthly_used_usd, 0)
-        ELSE $8
+        ELSE $6 + CASE
+            WHEN (
+                (quota_last_reset_at IS NULL AND $8::bigint IS NULL)
+                OR CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) = $8
+            ) THEN GREATEST(
+                CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE PRECISION) - $9,
+                0
+            )
+            WHEN CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) >= $4
+                 AND CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) < $5
+                THEN GREATEST(CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE PRECISION), 0)
+            ELSE 0
+        END
     END,
-    quota_reset_day = $9,
+    quota_reset_day = $10,
     quota_last_reset_at = TO_TIMESTAMP($4::double precision),
     quota_expires_at = CASE
-        WHEN $10::bigint IS NULL THEN NULL
-        ELSE TO_TIMESTAMP($10::double precision)
+        WHEN $11::bigint IS NULL THEN NULL
+        ELSE TO_TIMESTAMP($11::double precision)
     END,
     updated_at = NOW()
 WHERE id = $1
@@ -172,7 +194,8 @@ WHERE id = $1
         .bind(window_end)
         .bind(patch.remote_monthly_used_usd)
         .bind(patch.preserve_local_used_usd)
-        .bind(patch.remote_monthly_used_usd)
+        .bind(observed_window_start)
+        .bind(observed_used_usd)
         .bind(patch.quota_reset_day.map(|days| days as i32))
         .bind(expires_at)
         .execute(&self.pool)

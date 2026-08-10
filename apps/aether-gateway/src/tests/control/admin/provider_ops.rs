@@ -5089,11 +5089,10 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     ))
     .attach_provider_quota_repository_for_tests(Arc::clone(&quota_repository))
     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data),
-    );
+    let app_state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data);
+    let gateway = build_router_with_state(app_state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -5117,7 +5116,15 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     );
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["local"]["monthly_used_usd"],
-        5.0
+        3.0
+    );
+    assert_eq!(
+        payload["data"]["extra"]["remote_quota_sync"]["local"]["remote_confirmed_used_usd"],
+        3.0
+    );
+    assert_eq!(
+        payload["data"]["extra"]["remote_quota_sync"]["local"]["pending_local_used_usd"],
+        0.0
     );
     let stored = quota_repository
         .find_by_provider_id("provider-openai")
@@ -5138,7 +5145,7 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     assert_eq!(subscription["monthly_used_usd"], 20.0);
     assert_eq!(subscription["local_sync_window"], "daily");
     assert_eq!(stored.monthly_quota_usd, Some(10.0));
-    assert_eq!(stored.monthly_used_usd, 5.0);
+    assert_eq!(stored.monthly_used_usd, 3.0);
     assert_eq!(stored.quota_reset_day, Some(1));
     assert_eq!(stored.quota_expires_at_unix_secs, Some(1_896_134_400));
 
@@ -5179,6 +5186,48 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
         .expect("quota should load")
         .expect("quota should exist");
     assert_eq!(stored_after_failure, stored);
+
+    let held_lock = app_state
+        .runtime_state
+        .lock_try_acquire(
+            "provider_ops:remote_quota_sync:provider-openai",
+            "concurrent-sync-test",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("runtime lock should be available")
+        .expect("remote quota lock should be acquired");
+    let contended_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-ops/providers/provider-openai/balance"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("contended request should return");
+    assert_eq!(contended_response.status(), StatusCode::OK);
+    let contended_payload: serde_json::Value = contended_response
+        .json()
+        .await
+        .expect("contended body should parse");
+    assert_eq!(contended_payload["status"], "unknown_error");
+    assert!(contended_payload["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("正在进行")));
+    app_state
+        .runtime_state
+        .lock_release(&held_lock)
+        .await
+        .expect("runtime lock should release");
+    let stored_after_contention = quota_repository
+        .find_by_provider_id("provider-openai")
+        .await
+        .expect("quota should load")
+        .expect("quota should exist");
+    assert_eq!(stored_after_contention, stored);
 
     gateway_handle.abort();
     ops_handle.abort();
