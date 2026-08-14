@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 
 const DEFAULT_PROGRESS_ENDPOINT: &str = "/api/v1/subscriptions/progress";
 const DAY_SECONDS: u64 = 24 * 60 * 60;
+const MAX_FUTURE_WINDOW_START_SKEW_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sub2ApiRemoteQuotaConfig {
@@ -200,6 +201,13 @@ pub fn parse_sub2api_remote_quota_groups(
     subscription_json: &Value,
 ) -> Result<Vec<Sub2ApiRemoteQuotaGroup>, String> {
     let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    parse_sub2api_remote_quota_groups_at(subscription_json, now_unix_secs)
+}
+
+fn parse_sub2api_remote_quota_groups_at(
+    subscription_json: &Value,
+    now_unix_secs: u64,
+) -> Result<Vec<Sub2ApiRemoteQuotaGroup>, String> {
     let mut groups = BTreeMap::<String, Sub2ApiRemoteQuotaGroup>::new();
     for subscription in parse_summary_subscriptions(subscription_json)? {
         if !subscription.is_active_at(now_unix_secs) {
@@ -239,13 +247,27 @@ pub fn parse_sub2api_remote_quota(
     progress_json: Option<&Value>,
     expected_group_id: &str,
 ) -> Result<Sub2ApiRemoteQuotaSnapshot, String> {
+    let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
+    parse_sub2api_remote_quota_at(
+        subscription_json,
+        progress_json,
+        expected_group_id,
+        now_unix_secs,
+    )
+}
+
+fn parse_sub2api_remote_quota_at(
+    subscription_json: &Value,
+    progress_json: Option<&Value>,
+    expected_group_id: &str,
+    now_unix_secs: u64,
+) -> Result<Sub2ApiRemoteQuotaSnapshot, String> {
     let expected_group_id = expected_group_id.trim();
     if expected_group_id.is_empty() {
         return Err("remote_quota.group_id 不能为空".to_string());
     }
 
     let subscriptions = parse_summary_subscriptions(subscription_json)?;
-    let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
     let mut matching = subscriptions
         .into_iter()
         .filter(|subscription| {
@@ -305,6 +327,16 @@ pub fn parse_sub2api_remote_quota(
             window.as_str()
         )
     })?;
+    if progress_window.window_start_unix_secs
+        > now_unix_secs.saturating_add(MAX_FUTURE_WINDOW_START_SKEW_SECONDS)
+        || progress_window.resets_at_unix_secs <= now_unix_secs
+    {
+        return Err(format!(
+            "Sub2API Group {} 的{}额度 progress 窗口不覆盖当前时间",
+            subscription.group_id,
+            window.as_str()
+        ));
+    }
     let limit_tolerance = summary_limit_usd.abs().max(1.0) * 1e-9;
     if (progress_window.limit_usd - summary_limit_usd).abs() > limit_tolerance {
         return Err(format!(
@@ -598,11 +630,32 @@ fn required_rfc3339_unix_secs(value: Option<&Value>, field: &str) -> Result<u64,
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_sub2api_remote_quota, parse_sub2api_remote_quota_config,
-        parse_sub2api_remote_quota_groups, validate_sub2api_same_origin_endpoint,
-        Sub2ApiQuotaWindowKind, Sub2ApiRemoteQuotaSnapshot,
+        parse_sub2api_remote_quota_at, parse_sub2api_remote_quota_config,
+        parse_sub2api_remote_quota_groups_at, validate_sub2api_same_origin_endpoint,
+        Sub2ApiQuotaWindowKind, Sub2ApiRemoteQuotaGroup, Sub2ApiRemoteQuotaSnapshot,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    const TEST_NOW_UNIX_SECS: u64 = 1_896_004_800; // 2030-01-30T12:00:00Z
+
+    fn parse_sub2api_remote_quota_groups(
+        subscription_json: &Value,
+    ) -> Result<Vec<Sub2ApiRemoteQuotaGroup>, String> {
+        parse_sub2api_remote_quota_groups_at(subscription_json, TEST_NOW_UNIX_SECS)
+    }
+
+    fn parse_sub2api_remote_quota(
+        subscription_json: &Value,
+        progress_json: Option<&Value>,
+        expected_group_id: &str,
+    ) -> Result<Sub2ApiRemoteQuotaSnapshot, String> {
+        parse_sub2api_remote_quota_at(
+            subscription_json,
+            progress_json,
+            expected_group_id,
+            TEST_NOW_UNIX_SECS,
+        )
+    }
 
     fn summary() -> serde_json::Value {
         json!({
@@ -1021,6 +1074,23 @@ mod tests {
         let error = parse_sub2api_remote_quota(&summary(), None, "42")
             .expect_err("limited quota needs progress");
         assert!(error.contains("subscriptions/progress"));
+    }
+
+    #[test]
+    fn rejects_stale_or_future_progress_windows() {
+        let mut stale = progress();
+        stale["data"][0]["progress"]["monthly"]["window_start"] = json!("2030-01-01T00:00:00Z");
+        stale["data"][0]["progress"]["monthly"]["resets_at"] = json!("2030-01-30T00:00:00Z");
+        let stale_error = parse_sub2api_remote_quota(&summary(), Some(&stale), "42")
+            .expect_err("an expired progress window must not mutate local quota");
+        assert!(stale_error.contains("不覆盖当前时间"));
+
+        let mut future = progress();
+        future["data"][0]["progress"]["monthly"]["window_start"] = json!("2030-01-31T00:00:00Z");
+        future["data"][0]["progress"]["monthly"]["resets_at"] = json!("2030-03-02T00:00:00Z");
+        let future_error = parse_sub2api_remote_quota(&summary(), Some(&future), "42")
+            .expect_err("a future progress window must not poison the local window fence");
+        assert!(future_error.contains("不覆盖当前时间"));
     }
 
     #[test]

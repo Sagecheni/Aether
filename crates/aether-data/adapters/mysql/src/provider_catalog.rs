@@ -591,8 +591,9 @@ WHERE id = ?
                 "providers.config serialization failed: {error}"
             ))
         })?;
-        sqlx::query("UPDATE providers SET config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        sqlx::query("UPDATE providers SET config = ?, updated_at = ? WHERE id = ?")
             .bind(encoded_config)
+            .bind(current_unix_secs() as i64)
             .bind(&update.provider_id)
             .execute(&mut *tx)
             .await
@@ -3271,7 +3272,8 @@ mod tests {
     use super::MysqlProviderCatalogReadRepository;
     use crate::run_migrations;
     use aether_data_contracts::repository::provider_catalog::{
-        ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, StoredProviderCatalogEndpoint,
+        ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+        ProviderCatalogRuntimeCredentialsCas, StoredProviderCatalogEndpoint,
         StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use serde_json::json;
@@ -3499,7 +3501,16 @@ mod tests {
             Some(json!({"http":"proxy"})),
             Some(30.0),
             Some(2.5),
-            Some(json!({"region":"us"})),
+            Some(json!({
+                "region": "us",
+                "provider_ops": {
+                    "connector": {
+                        "credentials": {
+                            "refresh_token": "old-token"
+                        }
+                    }
+                }
+            })),
         );
         let created_provider = repository
             .create_provider(&provider, None)
@@ -3590,6 +3601,45 @@ mod tests {
             .expect("active providers should list")
             .iter()
             .any(|provider| provider.id == provider_id));
+
+        let timestamp_before_patch = super::current_unix_secs();
+        assert!(repository
+            .compare_and_patch_provider_ops_runtime_credentials(
+                &ProviderCatalogRuntimeCredentialsCas {
+                    provider_id: provider_id.clone(),
+                    expected_provider_config: created_provider.config.clone(),
+                    expected_provider_website: created_provider.website.clone(),
+                    expected_provider_proxy: created_provider.proxy.clone(),
+                    encrypted_credentials: json!({"refresh_token":"new-token"})
+                        .as_object()
+                        .expect("credential patch should be an object")
+                        .clone(),
+                },
+            )
+            .await
+            .expect("runtime credentials should patch"));
+        let timestamp_after_patch = super::current_unix_secs();
+        let patched_provider = repository
+            .list_providers_by_ids(std::slice::from_ref(&provider_id))
+            .await
+            .expect("patched provider should reload")
+            .pop()
+            .expect("patched provider should exist");
+        assert_eq!(
+            patched_provider
+                .config
+                .as_ref()
+                .and_then(
+                    |config| config.pointer("/provider_ops/connector/credentials/refresh_token")
+                )
+                .and_then(serde_json::Value::as_str),
+            Some("new-token")
+        );
+        assert!(patched_provider
+            .updated_at_unix_secs
+            .is_some_and(|updated_at| {
+                (timestamp_before_patch..=timestamp_after_patch).contains(&updated_at)
+            }));
 
         let endpoints = repository
             .list_endpoints_by_ids(std::slice::from_ref(&endpoint_id))

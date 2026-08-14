@@ -12,7 +12,8 @@ use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
 use aether_data::repository::quota::InMemoryProviderQuotaRepository;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_data_contracts::repository::quota::{
-    ProviderQuotaReadRepository, StoredProviderQuotaSnapshot,
+    ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository, ProviderQuotaUsageObservation,
+    ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
 use aether_runtime_state::{RedisClientConfig, RuntimeState};
 use aether_test_support::ManagedRedisServer;
@@ -4933,8 +4934,29 @@ fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota() {
 }
 
 async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl() {
+    let now = chrono::Utc::now();
+    let daily_window_start = now - chrono::Duration::hours(12);
+    let daily_window_end = daily_window_start + chrono::Duration::days(1);
+    let weekly_window_start = now - chrono::Duration::days(3);
+    let weekly_window_end = weekly_window_start + chrono::Duration::days(7);
+    let monthly_window_start = now - chrono::Duration::days(15);
+    let monthly_window_end = monthly_window_start + chrono::Duration::days(30);
+    let subscription_expires_at = now + chrono::Duration::days(45);
+    let daily_window_start_unix_i64 = daily_window_start.timestamp().max(1);
+    let daily_window_start_unix = daily_window_start_unix_i64 as u64;
+    let daily_window_end_unix = daily_window_end.timestamp().max(1) as u64;
+    let subscription_expires_at_unix = subscription_expires_at.timestamp().max(1) as u64;
+    let daily_window_start = daily_window_start.to_rfc3339();
+    let daily_window_end = daily_window_end.to_rfc3339();
+    let weekly_window_start = weekly_window_start.to_rfc3339();
+    let weekly_window_end = weekly_window_end.to_rfc3339();
+    let monthly_window_start = monthly_window_start.to_rfc3339();
+    let monthly_window_end = monthly_window_end.to_rfc3339();
+    let subscription_expires_at = subscription_expires_at.to_rfc3339();
+
     let progress_mode = Arc::new(AtomicUsize::new(0));
     let progress_mode_for_route = Arc::clone(&progress_mode);
+    let summary_expires_at = subscription_expires_at.clone();
     let ops = Router::new()
         .route(
             "/api/v1/auth/me",
@@ -4954,35 +4976,44 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
         )
         .route(
             "/api/v1/subscriptions/summary",
-            get(|| async move {
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "code": 0,
-                        "data": {
-                            "active_count": 1,
-                            "subscriptions": [{
-                                "id": 9,
-                                "group_id": 42,
-                                "group_name": "Pro",
-                                "status": "active",
-                                "daily_used_usd": 3,
-                                "daily_limit_usd": 10,
-                                "weekly_used_usd": 8,
-                                "weekly_limit_usd": 50,
-                                "monthly_used_usd": 20,
-                                "monthly_limit_usd": 100,
-                                "expires_at": "2030-02-01T00:00:00Z"
-                            }]
-                        }
-                    })),
-                )
+            get(move || {
+                let expires_at = summary_expires_at.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "code": 0,
+                            "data": {
+                                "active_count": 1,
+                                "subscriptions": [{
+                                    "id": 9,
+                                    "group_id": 42,
+                                    "group_name": "Pro",
+                                    "status": "active",
+                                    "daily_used_usd": 3,
+                                    "daily_limit_usd": 10,
+                                    "weekly_used_usd": 8,
+                                    "weekly_limit_usd": 50,
+                                    "monthly_used_usd": 20,
+                                    "monthly_limit_usd": 100,
+                                    "expires_at": expires_at
+                                }]
+                            }
+                        })),
+                    )
+                }
             }),
         )
         .route(
             "/api/v1/subscriptions/progress",
             get(move || {
                 let progress_mode = Arc::clone(&progress_mode_for_route);
+                let daily_window_start = daily_window_start.clone();
+                let daily_window_end = daily_window_end.clone();
+                let weekly_window_start = weekly_window_start.clone();
+                let weekly_window_end = weekly_window_end.clone();
+                let monthly_window_start = monthly_window_start.clone();
+                let monthly_window_end = monthly_window_end.clone();
                 async move {
                     if progress_mode.load(Ordering::SeqCst) == 1 {
                         return (
@@ -5001,20 +5032,20 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
                                     "daily": {
                                         "limit_usd": 10,
                                         "used_usd": 3,
-                                        "window_start": "2030-01-30T00:00:00Z",
-                                        "resets_at": "2030-01-31T00:00:00Z"
+                                        "window_start": daily_window_start,
+                                        "resets_at": daily_window_end
                                     },
                                     "weekly": {
                                         "limit_usd": 50,
                                         "used_usd": 8,
-                                        "window_start": "2030-01-24T00:00:00Z",
-                                        "resets_at": "2030-01-31T00:00:00Z"
+                                        "window_start": weekly_window_start,
+                                        "resets_at": weekly_window_end
                                     },
                                     "monthly": {
                                         "limit_usd": 100,
                                         "used_usd": 20,
-                                        "window_start": "2030-01-01T00:00:00Z",
-                                        "resets_at": "2030-01-31T00:00:00Z"
+                                        "window_start": monthly_window_start,
+                                        "resets_at": monthly_window_end
                                     }
                                 }
                             }]
@@ -5078,7 +5109,7 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
             Some(100.0),
             5.0,
             None,
-            Some(1_895_961_600),
+            Some(daily_window_start_unix_i64),
             None,
             true,
         )
@@ -5088,10 +5119,40 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
         &provider_catalog_repository,
     ))
     .attach_provider_quota_repository_for_tests(Arc::clone(&quota_repository))
+    .with_system_config_values_for_tests(Vec::<(String, serde_json::Value)>::new())
     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
     let app_state = AppState::new()
         .expect("gateway should build")
         .with_data_state_for_tests(data);
+
+    // Reproduce the cache race: warm the scheduler cache at $5, then mutate
+    // the repository directly to $8. Reconciliation must observe the strong
+    // repository value and replace it with the remote $3, not add $3 again.
+    let cached = app_state
+        .read_provider_quota_snapshot("provider-openai")
+        .await
+        .expect("quota cache should load")
+        .expect("provider quota should exist");
+    assert_eq!(cached.monthly_used_usd, 5.0);
+    quota_repository
+        .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+            provider_id: "provider-openai".to_string(),
+            billing_type: "monthly_quota".to_string(),
+            monthly_quota_usd: Some(10.0),
+            remote_monthly_used_usd: 8.0,
+            remote_window_start_unix_secs: daily_window_start_unix,
+            remote_window_end_unix_secs: daily_window_end_unix,
+            quota_reset_day: Some(1),
+            quota_expires_at_unix_secs: Some(subscription_expires_at_unix),
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 5.0,
+                quota_last_reset_at_unix_secs: Some(daily_window_start_unix),
+            }),
+            preserve_local_used_usd: false,
+        })
+        .await
+        .expect("repository quota should advance behind the cache");
+
     let gateway = build_router_with_state(app_state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -5147,7 +5208,10 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     assert_eq!(stored.monthly_quota_usd, Some(10.0));
     assert_eq!(stored.monthly_used_usd, 3.0);
     assert_eq!(stored.quota_reset_day, Some(1));
-    assert_eq!(stored.quota_expires_at_unix_secs, Some(1_896_134_400));
+    assert_eq!(
+        stored.quota_expires_at_unix_secs,
+        Some(subscription_expires_at_unix)
+    );
 
     progress_mode.store(1, Ordering::SeqCst);
     let degraded_response = reqwest::Client::new()
@@ -5228,6 +5292,52 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
         .expect("quota should load")
         .expect("quota should exist");
     assert_eq!(stored_after_contention, stored);
+
+    // Disabling quota application must not strand the balance cache in a
+    // permanent pending state. Batch balance should refresh normally while
+    // apply_remote_quota reports the kill-switch skip and leaves quota intact.
+    progress_mode.store(0, Ordering::SeqCst);
+    app_state
+        .upsert_system_config_json_value(
+            aether_admin::system::ENABLE_PROVIDER_REMOTE_QUOTA_SYNC_CONFIG_KEY,
+            &json!(false),
+            None,
+        )
+        .await
+        .expect("remote quota kill switch should update");
+    app_state
+        .runtime_state
+        .kv_delete("provider_ops:balance:provider-openai")
+        .await
+        .expect("balance cache should clear");
+    let batch_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-ops/batch/balance"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!(["provider-openai"]))
+        .send()
+        .await
+        .expect("batch balance request should return");
+    assert_eq!(batch_response.status(), StatusCode::OK);
+    let batch_payload: serde_json::Value = batch_response
+        .json()
+        .await
+        .expect("batch balance payload should parse");
+    assert_eq!(batch_payload["provider-openai"]["status"], "success");
+    assert_eq!(
+        batch_payload["provider-openai"]["data"]["extra"]["remote_quota_sync"]["status"],
+        "skipped_kill_switch"
+    );
+    let stored_after_kill_switch = quota_repository
+        .find_by_provider_id("provider-openai")
+        .await
+        .expect("quota should load")
+        .expect("quota should exist");
+    assert_eq!(stored_after_kill_switch, stored);
 
     gateway_handle.abort();
     ops_handle.abort();

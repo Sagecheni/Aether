@@ -188,7 +188,11 @@ async fn admin_provider_ops_sub2api_balance_payload_inner(
     // absolute value while retaining only usage added during this fetch.
     let local_usage_observation = if remote_quota_config.is_some() {
         Some(
-            match state.app().read_provider_quota_snapshot(provider_id).await {
+            match state
+                .app()
+                .read_provider_quota_snapshot_strong(provider_id)
+                .await
+            {
                 Ok(Some(snapshot)) => Ok(ProviderQuotaUsageObservation::from(&snapshot)),
                 Ok(None) => Err("读取本地 Provider 配额失败: Provider 不存在".to_string()),
                 Err(error) => Err(format!(
