@@ -554,7 +554,7 @@ function isSensitiveField(key: string): boolean {
   return prop?.['x-sensitive'] === true
 }
 
-const { success: showSuccess, error: showError } = useToast()
+const { success: showSuccess, error: showError, showToast } = useToast()
 const { confirmDanger } = useConfirm()
 const proxyNodeSelectRef = ref<InstanceType<typeof ProxyNodeSelect> | null>(null)
 const proxyNodesStore = useProxyNodesStore()
@@ -889,7 +889,12 @@ async function handleSyncRemoteQuota() {
       emit('saved')
       return
     }
-    showError(sync?.message || result.message || '远程额度未应用，本地额度保持不变', '同步未应用')
+    showToast({
+      title: '本地额度未修改',
+      message: sync?.message || result.message || '远程额度同步未应用，请检查上游响应后重试。',
+      variant: 'error',
+      duration: 10_000,
+    })
   } catch (error: unknown) {
     showError(parseApiError(error, '同步远程额度失败'), '同步失败')
   } finally {

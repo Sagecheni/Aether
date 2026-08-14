@@ -36,6 +36,14 @@ impl Sub2ApiQuotaWindowKind {
             Self::Monthly => 30,
         }
     }
+
+    fn display_name_zh(self) -> &'static str {
+        match self {
+            Self::Daily => "日",
+            Self::Weekly => "周",
+            Self::Monthly => "月",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -322,9 +330,11 @@ fn parse_sub2api_remote_quota_at(
     }
     let progress_window = progress.window(window).ok_or_else(|| {
         format!(
-            "Sub2API Group {} 的{}额度窗口尚未激活或 progress 数据缺失",
+            "Sub2API Group {} 已配置{}额度，但 progress.{} 没有返回当前额度窗口。通常是该订阅尚未完成过成功的 API 请求，或上一窗口到期后新窗口尚未激活。请先用该订阅成功调用一次 API，或在 Sub2API 管理端重置{}额度，再重新同步。本次未修改 Aether 本地额度。",
             subscription.group_id,
-            window.as_str()
+            window.display_name_zh(),
+            window.as_str(),
+            window.display_name_zh(),
         )
     })?;
     if progress_window.window_start_unix_secs
@@ -921,6 +931,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn explains_how_to_activate_a_missing_weekly_progress_window() {
+        let summary = json!({
+            "code": 0,
+            "data": {"subscriptions": [{
+                "id": 9,
+                "group_id": 33,
+                "status": "active",
+                "weekly_limit_usd": 50
+            }]}
+        });
+        let progress = json!({
+            "code": 0,
+            "data": [{
+                "subscription": {"id": 9, "group_id": 33},
+                "progress": {}
+            }]
+        });
+
+        let error = parse_sub2api_remote_quota(&summary, Some(&progress), "33")
+            .expect_err("a finite quota without its progress window must fail closed");
+        assert_eq!(
+            error,
+            "Sub2API Group 33 已配置周额度，但 progress.weekly 没有返回当前额度窗口。通常是该订阅尚未完成过成功的 API 请求，或上一窗口到期后新窗口尚未激活。请先用该订阅成功调用一次 API，或在 Sub2API 管理端重置周额度，再重新同步。本次未修改 Aether 本地额度。"
+        );
     }
 
     #[test]
