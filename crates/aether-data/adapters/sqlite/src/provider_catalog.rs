@@ -13,9 +13,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogRuntimeCredentialsCas,
-    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogRuntimeCredentialsCas, ProviderCatalogUpstreamMetadataNamespaceUpdate,
+    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -731,6 +731,44 @@ WHERE id = ?
             )));
         }
         self.reload_provider(&provider.id, "updated").await
+    }
+
+    pub async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.provider_id, "provider catalog provider_id")?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let current_config = sqlx::query("SELECT config FROM providers WHERE id = ?")
+            .bind(&update.provider_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?
+            .map(|row| {
+                optional_json_from_string(row.try_get("config").map_sql_err()?, "providers.config")
+            })
+            .transpose()?;
+        let Some(current_config) = current_config else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        if current_config != update.expected_config {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE providers SET config = ?, updated_at = ? WHERE id = ?")
+            .bind(optional_json_to_string(&update.config, "providers.config")?)
+            .bind(
+                update
+                    .updated_at_unix_secs
+                    .unwrap_or_else(current_unix_secs) as i64,
+            )
+            .bind(&update.provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
     }
 
     pub async fn compare_and_patch_provider_ops_runtime_credentials(
@@ -2300,6 +2338,13 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         Self::update_provider(self, provider).await
     }
 
+    async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_update_provider_config(self, update).await
+    }
+
     async fn compare_and_patch_provider_ops_runtime_credentials(
         &self,
         update: &ProviderCatalogRuntimeCredentialsCas,
@@ -3448,7 +3493,8 @@ mod tests {
         ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
         ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthCredentialFence,
         ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-        ProviderCatalogRuntimeCredentialsCas, ProviderCatalogUpstreamMetadataNamespaceExpectation,
+        ProviderCatalogProviderConfigCasUpdate, ProviderCatalogRuntimeCredentialsCas,
+        ProviderCatalogUpstreamMetadataNamespaceExpectation,
         ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
         StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
@@ -3837,6 +3883,96 @@ mod tests {
             .compare_and_patch_provider_ops_runtime_credentials(&update)
             .await
             .expect("stale runtime credential patch should be rejected"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_provider_config_cas_does_not_overwrite_quota_or_rotating_credentials() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteProviderCatalogReadRepository::new(pool);
+        let mut provider = StoredProviderCatalogProvider::new(
+            "provider-config-cas".to_string(),
+            "Provider Config CAS".to_string(),
+            Some("https://example.com".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build");
+        provider.billing_type = Some("monthly_quota".to_string());
+        provider.monthly_quota_usd = Some(100.0);
+        provider.monthly_used_usd = Some(7.0);
+        provider.config = Some(json!({
+            "provider_ops": {
+                "connector": {"credentials": {"refresh_token": "old-token"}}
+            },
+            "feature_flag": false
+        }));
+        let created = repository
+            .create_provider(&provider, None)
+            .await
+            .expect("provider should create");
+        assert!(repository
+            .compare_and_patch_provider_ops_runtime_credentials(
+                &ProviderCatalogRuntimeCredentialsCas {
+                    provider_id: provider.id.clone(),
+                    expected_provider_config: created.config.clone(),
+                    expected_provider_website: created.website.clone(),
+                    expected_provider_proxy: created.proxy.clone(),
+                    encrypted_credentials: serde_json::Map::from_iter([(
+                        "refresh_token".to_string(),
+                        json!("new-token"),
+                    )]),
+                },
+            )
+            .await
+            .expect("runtime credential patch should succeed"));
+        assert!(!repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider.id.clone(),
+                expected_config: created.config,
+                config: Some(json!({"feature_flag": true})),
+                updated_at_unix_secs: Some(2_000),
+            })
+            .await
+            .expect("stale config should be rejected"));
+
+        let latest = repository
+            .list_providers_by_ids(std::slice::from_ref(&provider.id))
+            .await
+            .expect("provider should reload")
+            .pop()
+            .expect("provider should exist");
+        let mut next_config = latest.config.clone().expect("config should exist");
+        next_config["feature_flag"] = json!(true);
+        assert!(repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider.id.clone(),
+                expected_config: latest.config,
+                config: Some(next_config),
+                updated_at_unix_secs: Some(2_001),
+            })
+            .await
+            .expect("fresh config should update"));
+        let stored = repository
+            .list_providers_by_ids(std::slice::from_ref(&provider.id))
+            .await
+            .expect("provider should reload")
+            .pop()
+            .expect("provider should exist");
+        assert_eq!(stored.monthly_used_usd, Some(7.0));
+        assert_eq!(stored.monthly_quota_usd, Some(100.0));
+        assert_eq!(
+            stored.config.as_ref().and_then(
+                |config| config.pointer("/provider_ops/connector/credentials/refresh_token")
+            ),
+            Some(&json!("new-token"))
+        );
+        assert_eq!(stored.config.as_ref().unwrap()["feature_flag"], true);
     }
 
     #[tokio::test]

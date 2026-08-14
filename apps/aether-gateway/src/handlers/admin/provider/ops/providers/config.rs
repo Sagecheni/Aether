@@ -21,15 +21,20 @@ pub(super) fn admin_provider_ops_config_object(
     admin_provider_ops_pure::admin_provider_ops_config_object(provider)
 }
 
-pub(super) fn admin_provider_ops_remote_quota_enabled(
+pub(crate) fn admin_provider_ops_remote_quota_worker_eligible(
     provider: &StoredProviderCatalogProvider,
 ) -> bool {
-    admin_provider_ops_config_object(provider)
-        .and_then(|config| config.get("remote_quota"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|remote_quota| remote_quota.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
+    let Some(provider_ops) = admin_provider_ops_config_object(provider) else {
+        return false;
+    };
+    provider_ops
+        .get("architecture_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|architecture_id| architecture_id.eq_ignore_ascii_case("sub2api"))
+        && admin_provider_ops_pure::parse_sub2api_remote_quota_config(provider_ops)
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 pub(super) fn admin_provider_ops_connector_object(

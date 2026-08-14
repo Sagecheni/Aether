@@ -111,6 +111,22 @@ impl ApplyRemoteProviderQuotaPatch {
         Ok(())
     }
 
+    pub fn was_applied_after_observation(&self, stored: &StoredProviderQuotaSnapshot) -> bool {
+        let Some(observation) = self.local_usage_observation.as_ref() else {
+            return false;
+        };
+        let changed_after_observation = stored.quota_last_reset_at_unix_secs
+            != observation.quota_last_reset_at_unix_secs
+            || stored.monthly_used_usd != observation.monthly_used_usd;
+        changed_after_observation
+            && stored.quota_last_reset_at_unix_secs == Some(self.remote_window_start_unix_secs)
+            && stored.billing_type == self.billing_type
+            && stored.monthly_quota_usd == self.monthly_quota_usd
+            && stored.quota_reset_day == self.quota_reset_day
+            && stored.quota_expires_at_unix_secs == self.quota_expires_at_unix_secs
+            && stored.monthly_used_usd >= self.remote_monthly_used_usd
+    }
+
     pub fn reconciled_monthly_used_usd(&self, stored: &StoredProviderQuotaSnapshot) -> f64 {
         if self.preserve_local_used_usd {
             return stored.monthly_used_usd;
@@ -138,6 +154,15 @@ impl ApplyRemoteProviderQuotaPatch {
         };
 
         self.remote_monthly_used_usd + concurrent_local_usage
+    }
+
+    pub fn apply_to_snapshot(&self, stored: &mut StoredProviderQuotaSnapshot) {
+        stored.monthly_used_usd = self.reconciled_monthly_used_usd(stored);
+        stored.billing_type.clone_from(&self.billing_type);
+        stored.monthly_quota_usd = self.monthly_quota_usd;
+        stored.quota_reset_day = self.quota_reset_day;
+        stored.quota_last_reset_at_unix_secs = Some(self.remote_window_start_unix_secs);
+        stored.quota_expires_at_unix_secs = self.quota_expires_at_unix_secs;
     }
 }
 
@@ -314,6 +339,25 @@ mod tests {
 
         stored.quota_last_reset_at_unix_secs = Some(6_500);
         assert_eq!(patch.reconciled_monthly_used_usd(&stored), 8.0);
+    }
+
+    #[test]
+    fn repeated_remote_patch_is_detected_after_its_observation() {
+        let mut stored = sample_quota(Some(1_000));
+        stored.monthly_used_usd = 5.0;
+        let mut patch = patch();
+        patch.remote_window_start_unix_secs = 7_000;
+        patch.remote_window_end_unix_secs = 8_000;
+        patch.remote_monthly_used_usd = 4.0;
+        patch.local_usage_observation = Some(ProviderQuotaUsageObservation {
+            monthly_used_usd: 5.0,
+            quota_last_reset_at_unix_secs: Some(1_000),
+        });
+
+        assert!(!patch.was_applied_after_observation(&stored));
+        patch.apply_to_snapshot(&mut stored);
+        assert_eq!(stored.monthly_used_usd, 4.0);
+        assert!(patch.was_applied_after_observation(&stored));
     }
 
     #[test]

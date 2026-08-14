@@ -19,6 +19,7 @@ use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogPr
 use aether_data_contracts::repository::quota::{
     ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch, ProviderQuotaUsageObservation,
 };
+use aether_runtime_state::RuntimeLockLease;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::warn;
@@ -46,6 +47,7 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
             credentials,
             proxy_snapshot,
             remote_quota_config,
+            None,
         )
         .await;
     }
@@ -90,6 +92,7 @@ pub(super) async fn admin_provider_ops_sub2api_balance_payload(
         credentials,
         proxy_snapshot,
         remote_quota_config,
+        Some(&lock),
     )
     .await;
 
@@ -112,6 +115,7 @@ async fn admin_provider_ops_sub2api_balance_payload_inner(
     credentials: &serde_json::Map<String, serde_json::Value>,
     proxy_snapshot: Option<&ProxySnapshot>,
     remote_quota_config: Option<&Sub2ApiRemoteQuotaConfig>,
+    remote_quota_lock: Option<&RuntimeLockLease>,
 ) -> serde_json::Value {
     let start = std::time::Instant::now();
     let (access_token, updated_credentials, _frontend_updated_credentials) =
@@ -260,6 +264,36 @@ async fn admin_provider_ops_sub2api_balance_payload_inner(
         ),
         progress_request
     );
+    if let Some(lock) = remote_quota_lock {
+        match state
+            .runtime_state()
+            .lock_renew(lock, REMOTE_QUOTA_SYNC_LOCK_TTL)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return admin_provider_ops_action_error(
+                    "unknown_error",
+                    "query_balance",
+                    "远程额度同步锁已失效，本地额度保持不变".to_string(),
+                    None,
+                );
+            }
+            Err(error) => {
+                warn!(
+                    provider_id = %provider_id,
+                    error = ?error,
+                    "failed to renew remote quota sync lock"
+                );
+                return admin_provider_ops_action_error(
+                    "unknown_error",
+                    "query_balance",
+                    "远程额度同步锁续期失败，本地额度保持不变".to_string(),
+                    None,
+                );
+            }
+        }
+    }
     let me_result = me_result.map_err(|err| match err {
         AdminProviderOpsExecuteJsonError::InvalidJson(message)
         | AdminProviderOpsExecuteJsonError::Transport(message) => message,

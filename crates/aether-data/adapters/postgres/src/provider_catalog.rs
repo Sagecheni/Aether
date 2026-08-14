@@ -14,9 +14,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogRuntimeCredentialsCas,
-    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogRuntimeCredentialsCas, ProviderCatalogUpstreamMetadataNamespaceUpdate,
+    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -1455,6 +1455,45 @@ WHERE id = $1
                     provider.id
                 ))
             })
+    }
+
+    pub async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        if update.provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider catalog provider_id is empty".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let current_config = sqlx::query("SELECT config FROM providers WHERE id = $1 FOR UPDATE")
+            .bind(&update.provider_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_postgres_err()?
+            .map(|row| row.try_get::<Option<serde_json::Value>, _>("config"))
+            .transpose()
+            .map_postgres_err()?;
+        let Some(current_config) = current_config else {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(false);
+        };
+        if current_config != update.expected_config {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE providers SET config = $1::json, updated_at = CASE WHEN $2::double precision IS NULL THEN NOW() ELSE TO_TIMESTAMP($2::double precision) END WHERE id = $3",
+        )
+        .bind(&update.config)
+        .bind(update.updated_at_unix_secs.map(|value| value as f64))
+        .bind(&update.provider_id)
+        .execute(&mut *tx)
+        .await
+        .map_postgres_err()?;
+        tx.commit().await.map_postgres_err()?;
+        Ok(true)
     }
 
     pub async fn compare_and_patch_provider_ops_runtime_credentials(
@@ -2905,6 +2944,13 @@ impl ProviderCatalogWriteRepository for SqlxProviderCatalogReadRepository {
         Self::update_provider(self, provider).await
     }
 
+    async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_update_provider_config(self, update).await
+    }
+
     async fn compare_and_patch_provider_ops_runtime_credentials(
         &self,
         update: &ProviderCatalogRuntimeCredentialsCas,
@@ -3596,7 +3642,16 @@ fn map_key_row(row: &PgRow) -> Result<StoredProviderCatalogKey, DataLayerError> 
 #[cfg(test)]
 mod tests {
     use super::SqlxProviderCatalogReadRepository;
-    use crate::{PostgresPoolConfig, PostgresPoolFactory};
+    use crate::{PostgresPoolConfig, PostgresPoolFactory, SqlxProviderQuotaRepository};
+    use aether_data_contracts::repository::provider_catalog::{
+        ProviderCatalogProviderConfigCasUpdate, ProviderCatalogRuntimeCredentialsCas,
+        StoredProviderCatalogProvider,
+    };
+    use aether_data_contracts::repository::quota::{
+        ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository, ProviderQuotaUsageObservation,
+        ProviderQuotaWriteRepository,
+    };
+    use serde_json::json;
 
     #[tokio::test]
     async fn repository_constructs_from_lazy_pool() {
@@ -3615,6 +3670,125 @@ mod tests {
         let pool = factory.connect_lazy().expect("pool should build");
         let repository = SqlxProviderCatalogReadRepository::new(pool);
         let _ = repository.pool();
+    }
+
+    #[tokio::test]
+    async fn postgres_provider_config_and_remote_quota_cas_when_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping postgres provider CAS smoke test: AETHER_TEST_POSTGRES_URL unset");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("postgres test pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("postgres migrations should run");
+        let provider_id = format!("provider-cas-{}", uuid::Uuid::new_v4().simple());
+        let mut provider = StoredProviderCatalogProvider::new(
+            provider_id.clone(),
+            "Provider CAS".to_string(),
+            Some("https://example.com".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build");
+        provider.billing_type = Some("monthly_quota".to_string());
+        provider.monthly_quota_usd = Some(100.0);
+        provider.monthly_used_usd = Some(7.0);
+        provider.quota_reset_day = Some(7);
+        provider.quota_last_reset_at_unix_secs = Some(1_710_000_000);
+        provider.config = Some(json!({
+            "provider_ops": {
+                "connector": {"credentials": {"refresh_token": "old-token"}}
+            },
+            "feature_flag": false
+        }));
+        let repository = SqlxProviderCatalogReadRepository::new(pool.clone());
+        let created = repository
+            .create_provider(&provider, None)
+            .await
+            .expect("provider should create");
+        assert!(repository
+            .compare_and_patch_provider_ops_runtime_credentials(
+                &ProviderCatalogRuntimeCredentialsCas {
+                    provider_id: provider_id.clone(),
+                    expected_provider_config: created.config.clone(),
+                    expected_provider_website: created.website.clone(),
+                    expected_provider_proxy: created.proxy.clone(),
+                    encrypted_credentials: serde_json::Map::from_iter([(
+                        "refresh_token".to_string(),
+                        json!("new-token"),
+                    )]),
+                },
+            )
+            .await
+            .expect("runtime credential patch should succeed"));
+        assert!(!repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider_id.clone(),
+                expected_config: created.config,
+                config: Some(json!({"feature_flag": true})),
+                updated_at_unix_secs: Some(1_720_000_000),
+            })
+            .await
+            .expect("stale provider config should be rejected"));
+        let latest = repository
+            .list_providers_by_ids(std::slice::from_ref(&provider_id))
+            .await
+            .expect("provider should reload")
+            .pop()
+            .expect("provider should exist");
+        let mut next_config = latest.config.clone().expect("config should exist");
+        next_config["feature_flag"] = json!(true);
+        assert!(repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider_id.clone(),
+                expected_config: latest.config,
+                config: Some(next_config),
+                updated_at_unix_secs: Some(1_720_000_001),
+            })
+            .await
+            .expect("fresh provider config should update"));
+
+        let quota_repository = SqlxProviderQuotaRepository::new(pool);
+        let remote_patch = ApplyRemoteProviderQuotaPatch {
+            provider_id: provider_id.clone(),
+            billing_type: "monthly_quota".to_string(),
+            monthly_quota_usd: Some(50.0),
+            remote_monthly_used_usd: 3.0,
+            remote_window_start_unix_secs: 1_720_000_000,
+            remote_window_end_unix_secs: 1_720_604_800,
+            quota_reset_day: Some(7),
+            quota_expires_at_unix_secs: Some(1_730_000_000),
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 7.0,
+                quota_last_reset_at_unix_secs: Some(1_710_000_000),
+            }),
+            preserve_local_used_usd: false,
+        };
+        quota_repository
+            .apply_remote_provider_quota(&remote_patch)
+            .await
+            .expect("remote quota should apply");
+        quota_repository
+            .apply_remote_provider_quota(&remote_patch)
+            .await
+            .expect("repeated remote quota patch should be idempotent");
+        let stored = quota_repository
+            .find_by_provider_id(&provider_id)
+            .await
+            .expect("quota should reload")
+            .expect("quota should exist");
+        assert_eq!(stored.monthly_used_usd, 3.0);
+        repository
+            .delete_provider(&provider_id)
+            .await
+            .expect("provider cleanup should succeed");
     }
 
     #[test]

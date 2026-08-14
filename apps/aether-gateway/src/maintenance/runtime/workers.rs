@@ -526,6 +526,8 @@ pub(crate) fn spawn_provider_quota_alert_worker(
     ))
 }
 
+const PROVIDER_REMOTE_QUOTA_CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 async fn provider_remote_quota_sync_worker_interval(state: &AppState) -> Duration {
     match provider_remote_quota_sync_interval(&state.data).await {
         Ok(interval) => interval,
@@ -534,6 +536,19 @@ async fn provider_remote_quota_sync_worker_interval(state: &AppState) -> Duratio
             Duration::from_secs(PROVIDER_REMOTE_QUOTA_SYNC_INTERVAL_DEFAULT_SECONDS)
         }
     }
+}
+
+pub(super) fn provider_remote_quota_worker_sleep_duration(
+    last_attempt_finished_at: tokio::time::Instant,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> Option<Duration> {
+    let deadline = last_attempt_finished_at + interval;
+    (now < deadline).then(|| {
+        deadline
+            .saturating_duration_since(now)
+            .min(PROVIDER_REMOTE_QUOTA_CONFIG_POLL_INTERVAL)
+    })
 }
 
 pub(crate) fn spawn_provider_remote_quota_sync_worker(
@@ -550,12 +565,18 @@ pub(crate) fn spawn_provider_remote_quota_sync_worker(
             if let Err(err) = perform_provider_remote_quota_sync_once(&state).await {
                 log_maintenance_worker_failure("provider_remote_quota_sync", "startup", &err);
             }
-            let mut next_run = tokio::time::Instant::now()
-                + provider_remote_quota_sync_worker_interval(&state).await;
+            let mut last_attempt_finished_at = tokio::time::Instant::now();
             let mut deferred_since = None;
             loop {
-                tokio::time::sleep_until(next_run).await;
-                let run_started_at = tokio::time::Instant::now();
+                let interval = provider_remote_quota_sync_worker_interval(&state).await;
+                if let Some(delay) = provider_remote_quota_worker_sleep_duration(
+                    last_attempt_finished_at,
+                    tokio::time::Instant::now(),
+                    interval,
+                ) {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
                 if !should_defer_for_database_pressure(
                     &state.data,
                     "provider_remote_quota_sync",
@@ -565,8 +586,8 @@ pub(crate) fn spawn_provider_remote_quota_sync_worker(
                         log_maintenance_worker_failure("provider_remote_quota_sync", "tick", &err);
                     }
                 }
-                next_run =
-                    run_started_at + provider_remote_quota_sync_worker_interval(&state).await;
+                // Delay semantics: a slow run never creates an immediate catch-up loop.
+                last_attempt_finished_at = tokio::time::Instant::now();
             }
         },
     ))

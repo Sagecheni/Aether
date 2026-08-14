@@ -129,9 +129,6 @@ impl ProviderQuotaWriteRepository for SqlxProviderQuotaRepository {
         let window_start = i64::try_from(patch.remote_window_start_unix_secs).map_err(|_| {
             DataLayerError::InvalidInput("remote quota window is too large".to_string())
         })?;
-        let window_end = i64::try_from(patch.remote_window_end_unix_secs).map_err(|_| {
-            DataLayerError::InvalidInput("remote quota window is too large".to_string())
-        })?;
         let expires_at = patch
             .quota_expires_at_unix_secs
             .map(i64::try_from)
@@ -139,78 +136,71 @@ impl ProviderQuotaWriteRepository for SqlxProviderQuotaRepository {
             .map_err(|_| {
                 DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
             })?;
-        let observed_window_start = patch
-            .local_usage_observation
-            .as_ref()
-            .and_then(|observation| observation.quota_last_reset_at_unix_secs)
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| {
-                DataLayerError::InvalidInput("observed local quota window is too large".to_string())
-            })?;
-        let observed_used_usd = patch
-            .local_usage_observation
-            .as_ref()
-            .map_or(0.0, |observation| observation.monthly_used_usd);
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_postgres_err()?;
+        let row = sqlx::query(
+            r#"
+SELECT id AS provider_id,
+       CAST(billing_type AS TEXT) AS billing_type,
+       CAST(monthly_quota_usd AS DOUBLE PRECISION) AS monthly_quota_usd,
+       CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE PRECISION) AS monthly_used_usd,
+       quota_reset_day,
+       CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) AS quota_last_reset_at_unix_secs,
+       CAST(EXTRACT(EPOCH FROM quota_expires_at) AS BIGINT) AS quota_expires_at_unix_secs,
+       is_active
+FROM providers
+WHERE id = $1
+FOR UPDATE
+            "#,
+        )
+        .bind(patch.provider_id.trim())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_postgres_err()?;
+        let Some(row) = row else {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::ProviderNotFound);
+        };
+        let mut stored = map_row(&row)?;
+        if stored
+            .quota_last_reset_at_unix_secs
+            .is_some_and(|start| start >= patch.remote_window_end_unix_secs)
+        {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::StaleWindow(stored));
+        }
+        if patch.was_applied_after_observation(&stored) {
+            tx.rollback().await.map_postgres_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored));
+        }
+        patch.apply_to_snapshot(&mut stored);
+        sqlx::query(
             r#"
 UPDATE providers
 SET billing_type = CAST($2 AS providerbillingtype),
     monthly_quota_usd = $3,
-    monthly_used_usd = CASE
-        WHEN $7::boolean THEN COALESCE(monthly_used_usd, 0)
-        ELSE $6 + CASE
-            WHEN (
-                (quota_last_reset_at IS NULL AND $8::bigint IS NULL)
-                OR CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) = $8
-            ) THEN GREATEST(
-                CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE PRECISION) - $9,
-                0
-            )
-            WHEN CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) >= $4
-                 AND CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) < $5
-                THEN GREATEST(CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE PRECISION), 0)
-            ELSE 0
-        END
-    END,
-    quota_reset_day = $10,
-    quota_last_reset_at = TO_TIMESTAMP($4::double precision),
+    monthly_used_usd = $4,
+    quota_reset_day = $5,
+    quota_last_reset_at = TO_TIMESTAMP($6::double precision),
     quota_expires_at = CASE
-        WHEN $11::bigint IS NULL THEN NULL
-        ELSE TO_TIMESTAMP($11::double precision)
+        WHEN $7::bigint IS NULL THEN NULL
+        ELSE TO_TIMESTAMP($7::double precision)
     END,
     updated_at = NOW()
 WHERE id = $1
-  AND (
-      quota_last_reset_at IS NULL
-      OR CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) < $5
-  )
             "#,
         )
         .bind(patch.provider_id.trim())
-        .bind(&patch.billing_type)
-        .bind(patch.monthly_quota_usd)
+        .bind(&stored.billing_type)
+        .bind(stored.monthly_quota_usd)
+        .bind(stored.monthly_used_usd)
+        .bind(stored.quota_reset_day.map(|days| days as i32))
         .bind(window_start)
-        .bind(window_end)
-        .bind(patch.remote_monthly_used_usd)
-        .bind(patch.preserve_local_used_usd)
-        .bind(observed_window_start)
-        .bind(observed_used_usd)
-        .bind(patch.quota_reset_day.map(|days| days as i32))
         .bind(expires_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_postgres_err()?;
-
-        let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
-        if result.rows_affected() == 0 {
-            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(stored, patch);
-        }
-        stored
-            .map(ApplyRemoteProviderQuotaOutcome::Applied)
-            .ok_or_else(|| {
-                DataLayerError::UnexpectedValue("applied remote quota disappeared".to_string())
-            })
+        tx.commit().await.map_postgres_err()?;
+        Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored))
     }
 }
 

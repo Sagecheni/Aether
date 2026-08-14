@@ -97,13 +97,10 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         {
             return Ok(ApplyRemoteProviderQuotaOutcome::StaleWindow(quota.clone()));
         }
-        let reconciled_monthly_used_usd = patch.reconciled_monthly_used_usd(quota);
-        quota.billing_type = patch.billing_type.clone();
-        quota.monthly_quota_usd = patch.monthly_quota_usd;
-        quota.monthly_used_usd = reconciled_monthly_used_usd;
-        quota.quota_reset_day = patch.quota_reset_day;
-        quota.quota_last_reset_at_unix_secs = Some(patch.remote_window_start_unix_secs);
-        quota.quota_expires_at_unix_secs = patch.quota_expires_at_unix_secs;
+        if patch.was_applied_after_observation(quota) {
+            return Ok(ApplyRemoteProviderQuotaOutcome::Applied(quota.clone()));
+        }
+        patch.apply_to_snapshot(quota);
         Ok(ApplyRemoteProviderQuotaOutcome::Applied(quota.clone()))
     }
 }
@@ -172,6 +169,16 @@ mod tests {
                 .expect("initial apply should succeed"),
             ApplyRemoteProviderQuotaOutcome::Applied(_)
         ));
+        repository
+            .apply_remote_provider_quota(&first)
+            .await
+            .expect("repeating the same observation must be idempotent");
+        let stored = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should load")
+            .expect("quota should exist");
+        assert_eq!(stored.monthly_used_usd, 4.0);
 
         let same_window_lower = ApplyRemoteProviderQuotaPatch {
             remote_monthly_used_usd: 3.0,

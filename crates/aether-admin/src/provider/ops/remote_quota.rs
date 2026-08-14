@@ -294,8 +294,7 @@ fn parse_sub2api_remote_quota_at(
     }
     let subscription = matching.remove(0);
 
-    let Some((window, summary_limit_usd, summary_used_usd)) = subscription.local_sync_window()
-    else {
+    let Some((window, summary_limit_usd, _)) = subscription.local_sync_window() else {
         return Ok(Sub2ApiRemoteQuotaSnapshot::ActiveUnlimited {
             group_id: subscription.group_id,
             group_name: subscription.group_name,
@@ -362,7 +361,9 @@ fn parse_sub2api_remote_quota_at(
         subscription_id: subscription.id,
         window,
         limit_usd: summary_limit_usd,
-        used_usd: summary_used_usd.max(progress_window.used_usd),
+        // Only progress binds usage to the selected window. Summary is fetched
+        // independently and its usage may still belong to the previous window.
+        used_usd: progress_window.used_usd,
         window_start_unix_secs: progress_window.window_start_unix_secs,
         resets_at_unix_secs: progress_window.resets_at_unix_secs,
         // Summary owns subscription identity and expiry; progress only enriches
@@ -880,8 +881,23 @@ mod tests {
         };
         assert_eq!(window, Sub2ApiQuotaWindowKind::Daily);
         assert_eq!(limit_usd, 10.0);
-        assert_eq!(used_usd, 2.0);
+        assert_eq!(used_usd, 1.5);
         assert_eq!(resets_at_unix_secs - window_start_unix_secs, 86_400);
+    }
+
+    #[test]
+    fn progress_usage_owns_the_selected_window_at_rollover() {
+        let mut old_summary = summary();
+        old_summary["data"]["subscriptions"][0]["monthly_used_usd"] = json!(100.0);
+        let mut new_progress = progress();
+        new_progress["data"][0]["progress"]["monthly"]["used_usd"] = json!(0.0);
+
+        let parsed = parse_sub2api_remote_quota(&old_summary, Some(&new_progress), "42")
+            .expect("rollover responses should parse");
+        assert!(matches!(
+            parsed,
+            Sub2ApiRemoteQuotaSnapshot::ActiveLimited { used_usd: 0.0, .. }
+        ));
     }
 
     #[test]
@@ -927,7 +943,7 @@ mod tests {
             Sub2ApiRemoteQuotaSnapshot::ActiveLimited {
                 window: Sub2ApiQuotaWindowKind::Weekly,
                 limit_usd: 50.0,
-                used_usd: 8.0,
+                used_usd: 7.0,
                 ..
             }
         ));
@@ -972,7 +988,7 @@ mod tests {
                 subscription_id: "9".to_string(),
                 window: Sub2ApiQuotaWindowKind::Monthly,
                 limit_usd: 100.0,
-                used_usd: 12.5,
+                used_usd: 12.0,
                 window_start_unix_secs: 1_893_456_000,
                 resets_at_unix_secs: 1_896_048_000,
                 expires_at_unix_secs: Some(1_896_134_400),

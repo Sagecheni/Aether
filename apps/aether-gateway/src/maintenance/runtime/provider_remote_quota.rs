@@ -16,7 +16,8 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::admin_api::{
-    admin_provider_ops_local_action_response, store_admin_provider_ops_balance_cache, AdminAppState,
+    admin_provider_ops_local_action_response, admin_provider_ops_remote_quota_worker_eligible,
+    store_admin_provider_ops_balance_cache, AdminAppState,
 };
 use crate::data::GatewayDataState;
 use crate::{AppState, GatewayError};
@@ -68,7 +69,7 @@ pub(crate) async fn perform_provider_remote_quota_sync_once(
         .list_provider_catalog_providers(true)
         .await?
         .into_iter()
-        .filter(provider_has_enabled_sub2api_remote_quota)
+        .filter(admin_provider_ops_remote_quota_worker_eligible)
         .collect::<Vec<_>>();
     if providers.is_empty() {
         return Ok(empty_summary());
@@ -178,26 +179,6 @@ async fn sync_provider_remote_quota(
     (provider_id, outcome, message)
 }
 
-fn provider_has_enabled_sub2api_remote_quota(provider: &StoredProviderCatalogProvider) -> bool {
-    let Some(provider_ops) = provider
-        .config
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|config| config.get("provider_ops"))
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-    provider_ops
-        .get("architecture_id")
-        .and_then(Value::as_str)
-        .is_some_and(|architecture_id| architecture_id.eq_ignore_ascii_case("sub2api"))
-        && aether_admin::provider::ops::parse_sub2api_remote_quota_config(provider_ops)
-            .ok()
-            .flatten()
-            .is_some()
-}
-
 const fn empty_summary() -> ProviderRemoteQuotaSyncRunSummary {
     ProviderRemoteQuotaSyncRunSummary {
         attempted: 0,
@@ -209,7 +190,7 @@ const fn empty_summary() -> ProviderRemoteQuotaSyncRunSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_has_enabled_sub2api_remote_quota;
+    use crate::admin_api::admin_provider_ops_remote_quota_worker_eligible;
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use serde_json::json;
 
@@ -227,7 +208,7 @@ mod tests {
 
     #[test]
     fn selects_only_enabled_sub2api_remote_quota() {
-        assert!(provider_has_enabled_sub2api_remote_quota(&provider(
+        assert!(admin_provider_ops_remote_quota_worker_eligible(&provider(
             json!({
                 "provider_ops": {
                     "architecture_id": "sub2api",
@@ -238,7 +219,7 @@ mod tests {
                 }
             })
         )));
-        assert!(!provider_has_enabled_sub2api_remote_quota(&provider(
+        assert!(!admin_provider_ops_remote_quota_worker_eligible(&provider(
             json!({
                 "provider_ops": {
                     "architecture_id": "sub2api",
@@ -246,7 +227,15 @@ mod tests {
                 }
             })
         )));
-        assert!(!provider_has_enabled_sub2api_remote_quota(&provider(
+        assert!(!admin_provider_ops_remote_quota_worker_eligible(&provider(
+            json!({
+                "provider_ops": {
+                    "architecture_id": "sub2api",
+                    "remote_quota": {"enabled": true}
+                }
+            })
+        )));
+        assert!(!admin_provider_ops_remote_quota_worker_eligible(&provider(
             json!({
                 "provider_ops": {
                     "architecture_id": "generic_api",

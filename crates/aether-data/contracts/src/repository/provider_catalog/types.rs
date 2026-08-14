@@ -202,6 +202,26 @@ pub struct StoredProviderCatalogProvider {
 }
 
 #[derive(Clone, PartialEq)]
+pub struct ProviderCatalogProviderConfigCasUpdate {
+    pub provider_id: String,
+    pub expected_config: Option<serde_json::Value>,
+    pub config: Option<serde_json::Value>,
+    pub updated_at_unix_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for ProviderCatalogProviderConfigCasUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderCatalogProviderConfigCasUpdate")
+            .field("provider_id", &self.provider_id)
+            .field("expected_config", &"<redacted>")
+            .field("config", &"<redacted>")
+            .field("updated_at_unix_secs", &self.updated_at_unix_secs)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ProviderCatalogRuntimeCredentialsCas {
     pub provider_id: String,
     pub expected_provider_config: Option<serde_json::Value>,
@@ -915,6 +935,13 @@ pub trait ProviderCatalogWriteRepository: Send + Sync {
         &self,
         provider: &StoredProviderCatalogProvider,
     ) -> Result<StoredProviderCatalogProvider, crate::DataLayerError>;
+
+    /// CAS-replaces only the provider config document. Quota, routing, and other
+    /// provider fields must remain untouched.
+    async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, crate::DataLayerError>;
 
     /// CAS-patches only rotating Provider Ops token fields without overwriting
     /// a concurrent administrator mutation.

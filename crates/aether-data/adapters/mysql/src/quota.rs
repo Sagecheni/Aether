@@ -142,9 +142,6 @@ WHERE billing_type = 'monthly_quota'
         let window_start = i64::try_from(patch.remote_window_start_unix_secs).map_err(|_| {
             DataLayerError::InvalidInput("remote quota window is too large".to_string())
         })?;
-        let window_end = i64::try_from(patch.remote_window_end_unix_secs).map_err(|_| {
-            DataLayerError::InvalidInput("remote quota window is too large".to_string())
-        })?;
         let expires_at = patch
             .quota_expires_at_unix_secs
             .map(i64::try_from)
@@ -152,71 +149,69 @@ WHERE billing_type = 'monthly_quota'
             .map_err(|_| {
                 DataLayerError::InvalidInput("remote quota expiry is too large".to_string())
             })?;
-        let observed_window_start = patch
-            .local_usage_observation
-            .as_ref()
-            .and_then(|observation| observation.quota_last_reset_at_unix_secs)
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| {
-                DataLayerError::InvalidInput("observed local quota window is too large".to_string())
-            })?;
-        let observed_used_usd = patch
-            .local_usage_observation
-            .as_ref()
-            .map_or(0.0, |observation| observation.monthly_used_usd);
-        let now = chrono::Utc::now().timestamp().max(0);
-        let rows_affected = sqlx::query(
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let row = sqlx::query(
+            r#"
+SELECT id AS provider_id,
+       billing_type,
+       CAST(monthly_quota_usd AS DOUBLE) AS monthly_quota_usd,
+       CAST(COALESCE(monthly_used_usd, 0) AS DOUBLE) AS monthly_used_usd,
+       quota_reset_day,
+       quota_last_reset_at AS quota_last_reset_at_unix_secs,
+       quota_expires_at AS quota_expires_at_unix_secs,
+       is_active
+FROM providers
+WHERE id = ?
+FOR UPDATE
+            "#,
+        )
+        .bind(patch.provider_id.trim())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let Some(row) = row else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::ProviderNotFound);
+        };
+        let mut stored = map_row(&row)?;
+        if stored
+            .quota_last_reset_at_unix_secs
+            .is_some_and(|start| start >= patch.remote_window_end_unix_secs)
+        {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::StaleWindow(stored));
+        }
+        if patch.was_applied_after_observation(&stored) {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored));
+        }
+        patch.apply_to_snapshot(&mut stored);
+        sqlx::query(
             r#"
 UPDATE providers
 SET billing_type = ?,
     monthly_quota_usd = ?,
-    monthly_used_usd = CASE
-        WHEN ? THEN COALESCE(monthly_used_usd, 0)
-        ELSE ? + CASE
-            WHEN quota_last_reset_at <=> ?
-                THEN GREATEST(COALESCE(monthly_used_usd, 0) - ?, 0)
-            WHEN quota_last_reset_at >= ? AND quota_last_reset_at < ?
-                THEN GREATEST(COALESCE(monthly_used_usd, 0), 0)
-            ELSE 0
-        END
-    END,
+    monthly_used_usd = ?,
     quota_reset_day = ?,
     quota_last_reset_at = ?,
     quota_expires_at = ?,
     updated_at = ?
 WHERE id = ?
-  AND (quota_last_reset_at IS NULL OR quota_last_reset_at < ?)
             "#,
         )
-        .bind(&patch.billing_type)
-        .bind(patch.monthly_quota_usd)
-        .bind(patch.preserve_local_used_usd)
-        .bind(patch.remote_monthly_used_usd)
-        .bind(observed_window_start)
-        .bind(observed_used_usd)
-        .bind(window_start)
-        .bind(window_end)
-        .bind(patch.quota_reset_day.map(|days| days as i64))
+        .bind(&stored.billing_type)
+        .bind(stored.monthly_quota_usd)
+        .bind(stored.monthly_used_usd)
+        .bind(stored.quota_reset_day.map(|days| days as i64))
         .bind(window_start)
         .bind(expires_at)
-        .bind(now)
+        .bind(chrono::Utc::now().timestamp().max(0))
         .bind(patch.provider_id.trim())
-        .bind(window_end)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_sql_err()?
-        .rows_affected();
-
-        let stored = self.find_by_provider_id(patch.provider_id.trim()).await?;
-        if rows_affected == 0 {
-            return ApplyRemoteProviderQuotaOutcome::from_unapplied_row(stored, patch);
-        }
-        stored
-            .map(ApplyRemoteProviderQuotaOutcome::Applied)
-            .ok_or_else(|| {
-                DataLayerError::UnexpectedValue("applied remote quota disappeared".to_string())
-            })
+        .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored))
     }
 }
 

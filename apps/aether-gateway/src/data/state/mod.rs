@@ -125,8 +125,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogRuntimeCredentialsCas,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogRuntimeCredentialsCas, ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };

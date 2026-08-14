@@ -5,7 +5,7 @@ use super::super::balance_cache::{
     store_admin_provider_ops_balance_cache, AdminProviderOpsBalanceCacheLookup,
 };
 use super::super::config::{
-    admin_provider_ops_config_object, admin_provider_ops_remote_quota_enabled,
+    admin_provider_ops_config_object, admin_provider_ops_remote_quota_worker_eligible,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::shared::system_config_bool;
@@ -91,7 +91,7 @@ pub(super) async fn handle_admin_provider_ops_batch_balance(
             let remote_quota_refresh_owned_by_worker = remote_quota_sync_enabled
                 && provider
                     .as_ref()
-                    .is_some_and(admin_provider_ops_remote_quota_enabled);
+                    .is_some_and(admin_provider_ops_remote_quota_worker_eligible);
             let result = if provider
                 .as_ref()
                 .is_some_and(|provider| admin_provider_ops_config_object(provider).is_some())

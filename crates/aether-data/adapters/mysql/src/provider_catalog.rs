@@ -13,9 +13,9 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
-    ProviderCatalogReadRepository, ProviderCatalogRuntimeCredentialsCas,
-    ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogReadRepository,
+    ProviderCatalogRuntimeCredentialsCas, ProviderCatalogUpstreamMetadataNamespaceUpdate,
+    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
@@ -550,6 +550,44 @@ WHERE id = ?
             )));
         }
         self.reload_provider(&provider.id, "updated").await
+    }
+
+    pub async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.provider_id, "provider catalog provider_id")?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let current_config = sqlx::query("SELECT config FROM providers WHERE id = ? FOR UPDATE")
+            .bind(&update.provider_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?
+            .map(|row| {
+                optional_json_from_string(row.try_get("config").map_sql_err()?, "providers.config")
+            })
+            .transpose()?;
+        let Some(current_config) = current_config else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        if current_config != update.expected_config {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE providers SET config = ?, updated_at = ? WHERE id = ?")
+            .bind(optional_json_to_string(&update.config, "providers.config")?)
+            .bind(
+                update
+                    .updated_at_unix_secs
+                    .unwrap_or_else(current_unix_secs) as i64,
+            )
+            .bind(&update.provider_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
     }
 
     pub async fn compare_and_patch_provider_ops_runtime_credentials(
@@ -2094,6 +2132,13 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         Self::update_provider(self, provider).await
     }
 
+    async fn compare_and_update_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_update_provider_config(self, update).await
+    }
+
     async fn compare_and_patch_provider_ops_runtime_credentials(
         &self,
         update: &ProviderCatalogRuntimeCredentialsCas,
@@ -3273,8 +3318,12 @@ mod tests {
     use crate::run_migrations;
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
-        ProviderCatalogRuntimeCredentialsCas, StoredProviderCatalogEndpoint,
-        StoredProviderCatalogKey, StoredProviderCatalogProvider,
+        ProviderCatalogProviderConfigCasUpdate, ProviderCatalogRuntimeCredentialsCas,
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use aether_data_contracts::repository::quota::{
+        ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository, ProviderQuotaUsageObservation,
+        ProviderQuotaWriteRepository,
     };
     use serde_json::json;
     use sqlx::Execute;
@@ -3473,7 +3522,7 @@ mod tests {
         let provider_id = format!("provider-{suffix}");
         let endpoint_id = format!("endpoint-{suffix}");
         let key_id = format!("key-{suffix}");
-        let repository = MysqlProviderCatalogReadRepository::new(pool);
+        let repository = MysqlProviderCatalogReadRepository::new(pool.clone());
 
         let provider = StoredProviderCatalogProvider::new(
             provider_id.clone(),
@@ -3640,6 +3689,79 @@ mod tests {
             .is_some_and(|updated_at| {
                 (timestamp_before_patch..=timestamp_after_patch).contains(&updated_at)
             }));
+        assert!(!repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider_id.clone(),
+                expected_config: created_provider.config,
+                config: Some(json!({"region":"stale"})),
+                updated_at_unix_secs: Some(timestamp_after_patch),
+            })
+            .await
+            .expect("stale provider config should be rejected"));
+        let mut next_config = patched_provider
+            .config
+            .clone()
+            .expect("config should exist");
+        next_config["region"] = json!("eu");
+        assert!(repository
+            .compare_and_update_provider_config(&ProviderCatalogProviderConfigCasUpdate {
+                provider_id: provider_id.clone(),
+                expected_config: patched_provider.config,
+                config: Some(next_config),
+                updated_at_unix_secs: Some(timestamp_after_patch),
+            })
+            .await
+            .expect("fresh provider config should update"));
+        let config_updated_provider = repository
+            .list_providers_by_ids(std::slice::from_ref(&provider_id))
+            .await
+            .expect("config-updated provider should reload")
+            .pop()
+            .expect("config-updated provider should exist");
+        assert_eq!(config_updated_provider.monthly_used_usd, Some(7.5));
+        assert_eq!(
+            config_updated_provider
+                .config
+                .as_ref()
+                .and_then(
+                    |config| config.pointer("/provider_ops/connector/credentials/refresh_token")
+                )
+                .and_then(serde_json::Value::as_str),
+            Some("new-token")
+        );
+        let quota_repository = crate::MysqlProviderQuotaRepository::new(pool);
+        let remote_patch = ApplyRemoteProviderQuotaPatch {
+            provider_id: provider_id.clone(),
+            billing_type: "monthly_quota".to_string(),
+            monthly_quota_usd: Some(50.0),
+            remote_monthly_used_usd: 3.0,
+            remote_window_start_unix_secs: 1_720_000_000,
+            remote_window_end_unix_secs: 1_720_604_800,
+            quota_reset_day: Some(7),
+            quota_expires_at_unix_secs: Some(1_730_000_000),
+            local_usage_observation: Some(ProviderQuotaUsageObservation {
+                monthly_used_usd: 7.5,
+                quota_last_reset_at_unix_secs: Some(1_710_000_000),
+            }),
+            preserve_local_used_usd: false,
+        };
+        quota_repository
+            .apply_remote_provider_quota(&remote_patch)
+            .await
+            .expect("remote quota should apply");
+        quota_repository
+            .apply_remote_provider_quota(&remote_patch)
+            .await
+            .expect("repeated remote quota patch should be idempotent");
+        assert_eq!(
+            quota_repository
+                .find_by_provider_id(&provider_id)
+                .await
+                .expect("quota should reload")
+                .expect("quota should exist")
+                .monthly_used_usd,
+            3.0
+        );
 
         let endpoints = repository
             .list_endpoints_by_ids(std::slice::from_ref(&endpoint_id))
