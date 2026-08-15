@@ -185,6 +185,12 @@ FOR UPDATE
             tx.rollback().await.map_sql_err()?;
             return Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored));
         }
+        if patch.usage_changed_after_observation(&stored) {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::ConcurrentModification(
+                stored,
+            ));
+        }
         patch.apply_to_snapshot(&mut stored);
         sqlx::query(
             r#"

@@ -172,6 +172,12 @@ WHERE id = ?
             tx.rollback().await.map_sql_err()?;
             return Ok(ApplyRemoteProviderQuotaOutcome::Applied(stored));
         }
+        if patch.usage_changed_after_observation(&stored) {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(ApplyRemoteProviderQuotaOutcome::ConcurrentModification(
+                stored,
+            ));
+        }
         let expected_window_start = stored
             .quota_last_reset_at_unix_secs
             .map(i64::try_from)
@@ -318,6 +324,16 @@ mod tests {
             .apply_remote_provider_quota(&initial_remote)
             .await
             .expect("repeating the same observation must be idempotent");
+        assert!(matches!(
+            repository
+                .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                    remote_monthly_used_usd: 4.0,
+                    ..initial_remote.clone()
+                })
+                .await
+                .expect("divergent concurrent snapshot should classify"),
+            ApplyRemoteProviderQuotaOutcome::ConcurrentModification(_)
+        ));
         let quota = repository
             .find_by_provider_id("provider-1")
             .await

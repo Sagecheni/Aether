@@ -37,9 +37,9 @@ pub struct ApplyRemoteProviderQuotaPatch {
     pub remote_window_end_unix_secs: u64,
     pub quota_reset_day: Option<u64>,
     pub quota_expires_at_unix_secs: Option<u64>,
-    /// Local usage read immediately before fetching the authoritative remote
-    /// snapshot. A finite remote quota rebases older local estimates onto the
-    /// remote absolute value while retaining usage added during that fetch.
+    /// Local usage state read immediately before fetching the authoritative remote
+    /// snapshot. Finite remote quota is applied only if this state is unchanged;
+    /// otherwise the caller retries from a fresh observation.
     pub local_usage_observation: Option<ProviderQuotaUsageObservation>,
     /// Preserve the provider's current local usage when only quota state changes.
     pub preserve_local_used_usd: bool,
@@ -124,7 +124,17 @@ impl ApplyRemoteProviderQuotaPatch {
             && stored.monthly_quota_usd == self.monthly_quota_usd
             && stored.quota_reset_day == self.quota_reset_day
             && stored.quota_expires_at_unix_secs == self.quota_expires_at_unix_secs
-            && stored.monthly_used_usd >= self.remote_monthly_used_usd
+            && stored.monthly_used_usd == self.remote_monthly_used_usd
+    }
+
+    pub fn usage_changed_after_observation(&self, stored: &StoredProviderQuotaSnapshot) -> bool {
+        self.local_usage_observation
+            .as_ref()
+            .is_some_and(|observation| {
+                stored.quota_last_reset_at_unix_secs != observation.quota_last_reset_at_unix_secs
+                    || stored.monthly_used_usd != observation.monthly_used_usd
+            })
+            && !self.was_applied_after_observation(stored)
     }
 
     pub fn reconciled_monthly_used_usd(&self, stored: &StoredProviderQuotaSnapshot) -> f64 {
@@ -132,28 +142,7 @@ impl ApplyRemoteProviderQuotaPatch {
             return stored.monthly_used_usd;
         }
 
-        let observation = self
-            .local_usage_observation
-            .as_ref()
-            .expect("validated finite remote quota has a local usage observation");
-        let same_observed_window =
-            stored.quota_last_reset_at_unix_secs == observation.quota_last_reset_at_unix_secs;
-        let current_window_is_remote =
-            stored
-                .quota_last_reset_at_unix_secs
-                .is_some_and(|window_start| {
-                    window_start >= self.remote_window_start_unix_secs
-                        && window_start < self.remote_window_end_unix_secs
-                });
-        let concurrent_local_usage = if same_observed_window {
-            (stored.monthly_used_usd - observation.monthly_used_usd).max(0.0)
-        } else if current_window_is_remote {
-            stored.monthly_used_usd.max(0.0)
-        } else {
-            0.0
-        };
-
-        self.remote_monthly_used_usd + concurrent_local_usage
+        self.remote_monthly_used_usd
     }
 
     pub fn apply_to_snapshot(&self, stored: &mut StoredProviderQuotaSnapshot) {
@@ -170,13 +159,14 @@ impl ApplyRemoteProviderQuotaPatch {
 pub enum ApplyRemoteProviderQuotaOutcome {
     Applied(StoredProviderQuotaSnapshot),
     StaleWindow(StoredProviderQuotaSnapshot),
+    ConcurrentModification(StoredProviderQuotaSnapshot),
     ProviderNotFound,
 }
 
 impl ApplyRemoteProviderQuotaOutcome {
     /// Classify a zero-row remote quota UPDATE without mistaking an idempotent
     /// write for success. A row is already applied only when all state fields
-    /// match and its usage still covers the authoritative remote floor.
+    /// match and its usage equals the authoritative remote value.
     pub fn from_unapplied_row(
         stored: Option<StoredProviderQuotaSnapshot>,
         patch: &ApplyRemoteProviderQuotaPatch,
@@ -198,14 +188,11 @@ impl ApplyRemoteProviderQuotaOutcome {
             && snapshot.quota_reset_day == patch.quota_reset_day
             && snapshot.quota_expires_at_unix_secs == patch.quota_expires_at_unix_secs
             && (patch.preserve_local_used_usd
-                || snapshot.monthly_used_usd >= patch.remote_monthly_used_usd);
+                || snapshot.monthly_used_usd == patch.remote_monthly_used_usd);
         if already_applied {
             return Ok(Self::Applied(snapshot));
         }
-
-        Err(crate::DataLayerError::UnexpectedValue(
-            "remote provider quota update matched no row without a newer local window".to_string(),
-        ))
+        Ok(Self::ConcurrentModification(snapshot))
     }
 }
 
@@ -317,9 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_remote_authority_with_only_fetch_time_local_usage() {
+    fn reconciliation_uses_remote_authority_after_an_unchanged_observation() {
         let mut stored = sample_quota(Some(7_000));
-        stored.monthly_used_usd = 12.0;
+        stored.monthly_used_usd = 10.0;
         let mut patch = patch();
         patch.remote_monthly_used_usd = 8.0;
         patch.local_usage_observation = Some(ProviderQuotaUsageObservation {
@@ -327,17 +314,6 @@ mod tests {
             quota_last_reset_at_unix_secs: Some(7_000),
         });
 
-        assert_eq!(patch.reconciled_monthly_used_usd(&stored), 10.0);
-
-        stored.quota_last_reset_at_unix_secs = Some(7_500);
-        stored.monthly_used_usd = 2.0;
-        patch.local_usage_observation = Some(ProviderQuotaUsageObservation {
-            monthly_used_usd: 10.0,
-            quota_last_reset_at_unix_secs: Some(6_000),
-        });
-        assert_eq!(patch.reconciled_monthly_used_usd(&stored), 10.0);
-
-        stored.quota_last_reset_at_unix_secs = Some(6_500);
         assert_eq!(patch.reconciled_monthly_used_usd(&stored), 8.0);
     }
 
@@ -358,6 +334,18 @@ mod tests {
         patch.apply_to_snapshot(&mut stored);
         assert_eq!(stored.monthly_used_usd, 4.0);
         assert!(patch.was_applied_after_observation(&stored));
+
+        patch.remote_monthly_used_usd = 5.0;
+        assert!(!patch.was_applied_after_observation(&stored));
+        assert!(patch.usage_changed_after_observation(&stored));
+
+        stored.quota_last_reset_at_unix_secs = Some(7_000);
+        stored.monthly_used_usd = 6.0;
+        patch.local_usage_observation = Some(ProviderQuotaUsageObservation {
+            monthly_used_usd: 4.0,
+            quota_last_reset_at_unix_secs: Some(7_000),
+        });
+        assert!(patch.usage_changed_after_observation(&stored));
     }
 
     #[test]
@@ -393,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn unapplied_row_classifies_stale_missing_idempotent_and_failed() {
+    fn unapplied_row_classifies_stale_missing_idempotent_and_concurrent() {
         assert!(matches!(
             ApplyRemoteProviderQuotaOutcome::from_unapplied_row(None, &patch())
                 .expect("missing provider is an outcome"),
@@ -415,16 +403,13 @@ mod tests {
             .expect("an idempotent row is already applied"),
             ApplyRemoteProviderQuotaOutcome::Applied(_)
         ));
-        let error = ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
-            Some(sample_quota(Some(1_000))),
-            &patch(),
-        )
-        .expect_err("non-stale zero-row must not look applied");
-        assert!(
-            error
-                .to_string()
-                .contains("matched no row without a newer local window"),
-            "unexpected error: {error}"
-        );
+        assert!(matches!(
+            ApplyRemoteProviderQuotaOutcome::from_unapplied_row(
+                Some(sample_quota(Some(1_000))),
+                &patch(),
+            )
+            .expect("concurrent update is an outcome"),
+            ApplyRemoteProviderQuotaOutcome::ConcurrentModification(_)
+        ));
     }
 }

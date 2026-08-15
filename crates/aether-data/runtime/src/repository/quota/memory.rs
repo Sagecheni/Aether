@@ -100,6 +100,11 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         if patch.was_applied_after_observation(quota) {
             return Ok(ApplyRemoteProviderQuotaOutcome::Applied(quota.clone()));
         }
+        if patch.usage_changed_after_observation(quota) {
+            return Ok(ApplyRemoteProviderQuotaOutcome::ConcurrentModification(
+                quota.clone(),
+            ));
+        }
         patch.apply_to_snapshot(quota);
         Ok(ApplyRemoteProviderQuotaOutcome::Applied(quota.clone()))
     }
@@ -173,6 +178,16 @@ mod tests {
             .apply_remote_provider_quota(&first)
             .await
             .expect("repeating the same observation must be idempotent");
+        assert!(matches!(
+            repository
+                .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                    remote_monthly_used_usd: 5.0,
+                    ..first.clone()
+                })
+                .await
+                .expect("divergent concurrent snapshot should classify"),
+            ApplyRemoteProviderQuotaOutcome::ConcurrentModification(_)
+        ));
         let stored = repository
             .find_by_provider_id("provider-1")
             .await

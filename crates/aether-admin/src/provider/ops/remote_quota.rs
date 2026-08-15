@@ -108,7 +108,7 @@ impl SummarySubscription {
                 .is_none_or(|expires_at| expires_at > now_unix_secs)
     }
 
-    fn local_sync_window(&self) -> Option<(Sub2ApiQuotaWindowKind, f64, f64)> {
+    fn limited_windows(&self) -> impl Iterator<Item = (Sub2ApiQuotaWindowKind, f64, f64)> {
         [
             (
                 Sub2ApiQuotaWindowKind::Daily,
@@ -127,7 +127,15 @@ impl SummarySubscription {
             ),
         ]
         .into_iter()
-        .find(|(_, limit_usd, _)| *limit_usd > 0.0)
+        .filter(|(_, limit_usd, _)| *limit_usd > 0.0)
+    }
+
+    fn local_sync_window(&self) -> Option<(Sub2ApiQuotaWindowKind, f64, f64)> {
+        // Every upstream request consumes all active windows. The window with
+        // the least remaining USD is therefore the binding local constraint.
+        self.limited_windows().min_by(|left, right| {
+            remaining_usd(left.1, left.2).total_cmp(&remaining_usd(right.1, right.2))
+        })
     }
 }
 
@@ -294,20 +302,20 @@ fn parse_sub2api_remote_quota_at(
     }
     let subscription = matching.remove(0);
 
-    let Some((window, summary_limit_usd, _)) = subscription.local_sync_window() else {
+    let limited_windows = subscription.limited_windows().collect::<Vec<_>>();
+    if limited_windows.is_empty() {
         return Ok(Sub2ApiRemoteQuotaSnapshot::ActiveUnlimited {
             group_id: subscription.group_id,
             group_name: subscription.group_name,
             subscription_id: subscription.id,
             expires_at_unix_secs: subscription.expires_at_unix_secs,
         });
-    };
+    }
 
     let progress_json = progress_json.ok_or_else(|| {
         format!(
-            "Sub2API Group {} 的{}额度同步需要 subscriptions/progress 响应",
-            subscription.group_id,
-            window.as_str()
+            "Sub2API Group {} 的有限额度同步需要 subscriptions/progress 响应",
+            subscription.group_id
         )
     })?;
     let progresses = parse_progress_subscriptions(progress_json)?;
@@ -316,9 +324,8 @@ fn parse_sub2api_remote_quota_at(
     });
     let progress = matching_progress.next().ok_or_else(|| {
         format!(
-            "Sub2API Group {} 的{}额度 progress 数据缺失",
-            subscription.group_id,
-            window.as_str()
+            "Sub2API Group {} 的有限额度 progress 数据缺失",
+            subscription.group_id
         )
     })?;
     if matching_progress.next().is_some() {
@@ -327,6 +334,52 @@ fn parse_sub2api_remote_quota_at(
             subscription.group_id
         ));
     }
+    let (window, summary_limit_usd, progress_window) = limited_windows
+        .into_iter()
+        .map(|(window, summary_limit_usd, _)| {
+            validate_progress_window(
+                &subscription,
+                &progress,
+                window,
+                summary_limit_usd,
+                now_unix_secs,
+            )
+            .map(|progress_window| (window, summary_limit_usd, progress_window))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min_by(|left, right| {
+            remaining_usd(left.1, left.2.used_usd)
+                .total_cmp(&remaining_usd(right.1, right.2.used_usd))
+        })
+        .expect("finite quota has at least one validated progress window");
+
+    Ok(Sub2ApiRemoteQuotaSnapshot::ActiveLimited {
+        group_id: subscription.group_id,
+        group_name: subscription.group_name,
+        subscription_id: subscription.id,
+        window,
+        limit_usd: summary_limit_usd,
+        // Only progress binds usage to the selected window. Summary is fetched
+        // independently and its usage may still belong to the previous window.
+        used_usd: progress_window.used_usd,
+        window_start_unix_secs: progress_window.window_start_unix_secs,
+        resets_at_unix_secs: progress_window.resets_at_unix_secs,
+        // Summary owns subscription identity and expiry; progress only enriches
+        // the selected quota window and usage.
+        expires_at_unix_secs: subscription
+            .expires_at_unix_secs
+            .or(progress.expires_at_unix_secs),
+    })
+}
+
+fn validate_progress_window<'a>(
+    subscription: &SummarySubscription,
+    progress: &'a ProgressSubscription,
+    window: Sub2ApiQuotaWindowKind,
+    summary_limit_usd: f64,
+    now_unix_secs: u64,
+) -> Result<&'a ProgressWindow, String> {
     let progress_window = progress.window(window).ok_or_else(|| {
         format!(
             "Sub2API Group {} 已配置{}额度，但 progress.{} 没有返回当前额度窗口。通常是该订阅尚未完成过成功的 API 请求，或上一窗口到期后新窗口尚未激活。请先用该订阅成功调用一次 API，或在 Sub2API 管理端重置{}额度，再重新同步。本次未修改 Aether 本地额度。",
@@ -354,24 +407,11 @@ fn parse_sub2api_remote_quota_at(
             window.as_str()
         ));
     }
+    Ok(progress_window)
+}
 
-    Ok(Sub2ApiRemoteQuotaSnapshot::ActiveLimited {
-        group_id: subscription.group_id,
-        group_name: subscription.group_name,
-        subscription_id: subscription.id,
-        window,
-        limit_usd: summary_limit_usd,
-        // Only progress binds usage to the selected window. Summary is fetched
-        // independently and its usage may still belong to the previous window.
-        used_usd: progress_window.used_usd,
-        window_start_unix_secs: progress_window.window_start_unix_secs,
-        resets_at_unix_secs: progress_window.resets_at_unix_secs,
-        // Summary owns subscription identity and expiry; progress only enriches
-        // the selected quota window and usage.
-        expires_at_unix_secs: subscription
-            .expires_at_unix_secs
-            .or(progress.expires_at_unix_secs),
-    })
+fn remaining_usd(limit_usd: f64, used_usd: f64) -> f64 {
+    (limit_usd - used_usd).max(0.0)
 }
 
 fn parse_summary_subscriptions(payload: &Value) -> Result<Vec<SummarySubscription>, String> {
@@ -825,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_daily_window_before_other_finite_windows() {
+    fn selects_the_finite_window_with_the_least_remaining_quota() {
         let summary = json!({
             "code": 0,
             "data": {"subscriptions": [{
@@ -858,7 +898,7 @@ mod tests {
                     },
                     "weekly": {
                         "limit_usd": 50,
-                        "used_usd": 7,
+                        "used_usd": 50,
                         "window_start": "2030-01-24T00:00:00Z",
                         "resets_at": "2030-01-31T00:00:00Z"
                     }
@@ -879,10 +919,10 @@ mod tests {
         else {
             panic!("expected a finite quota window");
         };
-        assert_eq!(window, Sub2ApiQuotaWindowKind::Daily);
-        assert_eq!(limit_usd, 10.0);
-        assert_eq!(used_usd, 1.5);
-        assert_eq!(resets_at_unix_secs - window_start_unix_secs, 86_400);
+        assert_eq!(window, Sub2ApiQuotaWindowKind::Weekly);
+        assert_eq!(limit_usd, 50.0);
+        assert_eq!(used_usd, 50.0);
+        assert_eq!(resets_at_unix_secs - window_start_unix_secs, 604_800);
     }
 
     #[test]

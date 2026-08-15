@@ -155,7 +155,7 @@ async fn sync_provider_remote_quota(
     } else {
         match sync_status {
             Some("applied") => ProviderRemoteQuotaWorkerOutcome::Applied,
-            Some("stale_window" | "skipped_kill_switch") => {
+            Some("stale_window" | "concurrent_update" | "skipped_kill_switch") => {
                 ProviderRemoteQuotaWorkerOutcome::Skipped
             }
             _ => ProviderRemoteQuotaWorkerOutcome::Failed,

@@ -3322,8 +3322,8 @@ mod tests {
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use aether_data_contracts::repository::quota::{
-        ApplyRemoteProviderQuotaPatch, ProviderQuotaReadRepository, ProviderQuotaUsageObservation,
-        ProviderQuotaWriteRepository,
+        ApplyRemoteProviderQuotaOutcome, ApplyRemoteProviderQuotaPatch,
+        ProviderQuotaReadRepository, ProviderQuotaUsageObservation, ProviderQuotaWriteRepository,
     };
     use serde_json::json;
     use sqlx::Execute;
@@ -3753,6 +3753,16 @@ mod tests {
             .apply_remote_provider_quota(&remote_patch)
             .await
             .expect("repeated remote quota patch should be idempotent");
+        assert!(matches!(
+            quota_repository
+                .apply_remote_provider_quota(&ApplyRemoteProviderQuotaPatch {
+                    remote_monthly_used_usd: 4.0,
+                    ..remote_patch.clone()
+                })
+                .await
+                .expect("divergent remote quota patch should classify"),
+            ApplyRemoteProviderQuotaOutcome::ConcurrentModification(_)
+        ));
         assert_eq!(
             quota_repository
                 .find_by_provider_id(&provider_id)

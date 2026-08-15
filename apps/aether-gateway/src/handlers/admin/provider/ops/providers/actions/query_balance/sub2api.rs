@@ -421,7 +421,28 @@ async fn admin_provider_ops_sub2api_balance_payload_inner(
             remote_quota_failed_keep_local("Sub2API 套餐摘要响应缺失".to_string(), progress_warning)
         };
         if let Some(remote_subscription) = remote_subscription {
-            sync_status["subscription"] = json!(remote_subscription);
+            let mut remote_subscription = json!(remote_subscription);
+            let applied_window = sync_status
+                .pointer("/remote/window")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let applied_used_usd = sync_status.pointer("/remote/remote_used_usd").cloned();
+            let applied_limit_usd = sync_status.pointer("/remote/limit_usd").cloned();
+            if let (Some(window), Some(subscription)) =
+                (applied_window, remote_subscription.as_object_mut())
+            {
+                subscription.insert(
+                    "local_sync_window".to_string(),
+                    Value::String(window.clone()),
+                );
+                if let Some(used_usd) = applied_used_usd {
+                    subscription.insert(format!("{window}_used_usd"), used_usd);
+                }
+                if let Some(limit_usd) = applied_limit_usd {
+                    subscription.insert(format!("{window}_limit_usd"), limit_usd);
+                }
+            }
+            sync_status["subscription"] = remote_subscription;
         }
         attach_remote_quota_sync_status(&mut data, sync_status);
     }
@@ -473,7 +494,10 @@ async fn apply_remote_quota(
                 remote_monthly_used_usd: used_usd,
                 remote_window_start_unix_secs: window_start_unix_secs,
                 remote_window_end_unix_secs: resets_at_unix_secs,
-                quota_reset_day: Some(window.interval_days()),
+                // Remote progress owns the exact reset boundary. Keeping the
+                // local interval unset prevents the generic reset worker from
+                // reopening quota before the next authoritative sync.
+                quota_reset_day: None,
                 quota_expires_at_unix_secs: expires_at_unix_secs,
                 local_usage_observation: Some(local_usage_observation.clone()?),
                 preserve_local_used_usd: false,
@@ -572,6 +596,18 @@ async fn apply_remote_quota(
         ApplyRemoteProviderQuotaOutcome::StaleWindow(local) => Ok(json!({
             "status": "stale_window",
             "message": "远程套餐窗口早于本地已同步窗口，本地额度保持不变",
+            "remote": detail,
+            "local": {
+                "billing_type": local.billing_type,
+                "monthly_quota_usd": local.monthly_quota_usd,
+                "monthly_used_usd": local.monthly_used_usd,
+                "quota_last_reset_at_unix_secs": local.quota_last_reset_at_unix_secs,
+                "quota_expires_at_unix_secs": local.quota_expires_at_unix_secs,
+            }
+        })),
+        ApplyRemoteProviderQuotaOutcome::ConcurrentModification(local) => Ok(json!({
+            "status": "concurrent_update",
+            "message": "同步期间本地额度已变化，本次远程快照未应用",
             "remote": detail,
             "local": {
                 "billing_type": local.billing_type,

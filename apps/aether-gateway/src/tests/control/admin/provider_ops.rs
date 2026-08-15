@@ -37,6 +37,7 @@ use crate::constants::{
     TRUSTED_ADMIN_USER_ROLE_HEADER,
 };
 use crate::data::{GatewayDataConfig, GatewayDataState};
+use crate::maintenance::perform_provider_remote_quota_sync_once;
 
 const PROVIDER_OPS_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -4945,6 +4946,7 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     let daily_window_start_unix_i64 = daily_window_start.timestamp().max(1);
     let daily_window_start_unix = daily_window_start_unix_i64 as u64;
     let daily_window_end_unix = daily_window_end.timestamp().max(1) as u64;
+    let weekly_window_start_unix = weekly_window_start.timestamp().max(1) as u64;
     let subscription_expires_at_unix = subscription_expires_at.timestamp().max(1) as u64;
     let daily_window_start = daily_window_start.to_rfc3339();
     let daily_window_end = daily_window_end.to_rfc3339();
@@ -5037,7 +5039,7 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
                                     },
                                     "weekly": {
                                         "limit_usd": 50,
-                                        "used_usd": 8,
+                                        "used_usd": 49.5,
                                         "window_start": weekly_window_start,
                                         "resets_at": weekly_window_end
                                     },
@@ -5177,11 +5179,11 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
     );
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["local"]["monthly_used_usd"],
-        3.0
+        49.5
     );
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["local"]["remote_confirmed_used_usd"],
-        3.0
+        49.5
     );
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["local"]["pending_local_used_usd"],
@@ -5194,20 +5196,24 @@ async fn gateway_syncs_sub2api_group_finite_quota_into_local_provider_quota_impl
         .expect("quota should exist");
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["remote"]["window"],
-        "daily"
+        "weekly"
     );
     let subscription = &payload["data"]["extra"]["remote_quota_sync"]["subscription"];
     assert_eq!(subscription["group_id"], "42");
     assert_eq!(subscription["daily_limit_usd"], 10.0);
     assert_eq!(subscription["daily_used_usd"], 3.0);
     assert_eq!(subscription["weekly_limit_usd"], 50.0);
-    assert_eq!(subscription["weekly_used_usd"], 8.0);
+    assert_eq!(subscription["weekly_used_usd"], 49.5);
     assert_eq!(subscription["monthly_limit_usd"], 100.0);
     assert_eq!(subscription["monthly_used_usd"], 20.0);
-    assert_eq!(subscription["local_sync_window"], "daily");
-    assert_eq!(stored.monthly_quota_usd, Some(10.0));
-    assert_eq!(stored.monthly_used_usd, 3.0);
-    assert_eq!(stored.quota_reset_day, Some(1));
+    assert_eq!(subscription["local_sync_window"], "weekly");
+    assert_eq!(stored.monthly_quota_usd, Some(50.0));
+    assert_eq!(stored.monthly_used_usd, 49.5);
+    assert_eq!(stored.quota_reset_day, None);
+    assert_eq!(
+        stored.quota_last_reset_at_unix_secs,
+        Some(weekly_window_start_unix)
+    );
     assert_eq!(
         stored.quota_expires_at_unix_secs,
         Some(subscription_expires_at_unix)
@@ -5489,11 +5495,29 @@ async fn gateway_syncs_sub2api_group_unlimited_and_exhausted_keep_local_usage_im
     ))
     .attach_provider_quota_repository_for_tests(Arc::clone(&quota_repository))
     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data),
-    );
+    let app_state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data);
+
+    // Exercise the real worker path: provider discovery, eligibility, action
+    // execution, quota apply, result classification, and balance caching.
+    let worker_summary = perform_provider_remote_quota_sync_once(&app_state)
+        .await
+        .expect("remote quota worker should run");
+    assert_eq!(worker_summary.attempted, 1);
+    assert_eq!(worker_summary.applied, 1);
+    assert_eq!(worker_summary.skipped, 0);
+    assert_eq!(worker_summary.failed, 0);
+    let stored = quota_repository
+        .find_by_provider_id("provider-openai")
+        .await
+        .expect("quota should load")
+        .expect("quota should exist");
+    assert_eq!(stored.billing_type, "pay_as_you_go");
+    assert_eq!(stored.monthly_quota_usd, None);
+    assert_eq!(stored.monthly_used_usd, 5.0);
+
+    let gateway = build_router_with_state(app_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     async fn post_balance(gateway_url: &str) -> serde_json::Value {
@@ -5512,23 +5536,7 @@ async fn gateway_syncs_sub2api_group_unlimited_and_exhausted_keep_local_usage_im
         response.json().await.expect("json body should parse")
     }
 
-    // 1. Unlimited sync must not zero out locally accumulated usage.
-    let payload = post_balance(&gateway_url).await;
-    assert_eq!(payload["status"], "success");
-    let sync = &payload["data"]["extra"]["remote_quota_sync"];
-    assert_eq!(sync["status"], "applied");
-    assert_eq!(sync["remote"]["classification"], "active_unlimited");
-    assert_eq!(sync["local"]["monthly_used_usd"], 5.0);
-    let stored = quota_repository
-        .find_by_provider_id("provider-openai")
-        .await
-        .expect("quota should load")
-        .expect("quota should exist");
-    assert_eq!(stored.billing_type, "pay_as_you_go");
-    assert_eq!(stored.monthly_quota_usd, None);
-    assert_eq!(stored.monthly_used_usd, 5.0);
-
-    // 2. A second unlimited sync must not zero it out either.
+    // A second unlimited sync through the manual path must not zero it either.
     let payload = post_balance(&gateway_url).await;
     assert_eq!(
         payload["data"]["extra"]["remote_quota_sync"]["status"],
